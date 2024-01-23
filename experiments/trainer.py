@@ -34,7 +34,7 @@ from common.torch.ops import default_device, to_tensor, divide_no_nan
 from torch.distributions.studentT import StudentT
 #from torch.distributions.cauchy import Cauchy
 #from torch.distributions.laplace import Laplace
-
+from torch.distributions.gamma import Gamma
 
 ##
 ## training loop for point forecasts; loss based on distance
@@ -116,6 +116,18 @@ def t_nll_loss(forecast_mu, target, variance):
     m = StudentT(n, forecast_mu, s)
     return -1.0 * t.mean(t.sum(m.log_prob(target),dim=1))
 
+#def gamma_nll_loss(forecast_mu, target, variance):
+#    eps = 1e-6
+#    mu = forecast_mu + eps #t.nan_to_num(forecast_mu,1e-6) + eps
+#    s2 = variance + eps #t.nan_to_num(variance,1e-6) + eps
+#    mu2 = forecast_mu * forecast_mu + eps #t.nan_to_num(mu*mu,1e-6) + eps
+#    targ = target + eps ## must not be 0
+#    ## a = mu^2/var; b = mu/var
+#    a = mu2 / s2 
+#    b = mu / s2
+#    m = Gamma(a,b)
+#    return -1.0 * t.nanmean(t.nansum(m.log_prob(targ),dim=1))
+    
 #def cauchy_nll_loss(forecast_mu, target, s):
 #    m = Cauchy(forecast_mu, s)
 #    return -1.0 * t.mean(t.sum(m.log_prob(target),dim=1))
@@ -172,6 +184,7 @@ def trainer_var(snapshot_manager: SnapshotManager,
         training_loss = training_loss_fn(forecast_mu, y, forecast_var)
 
         if np.isnan(float(training_loss)):
+            print("argh")
             break
 
         training_loss.backward()

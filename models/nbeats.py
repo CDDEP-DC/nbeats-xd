@@ -209,16 +209,17 @@ class NBeats_var(t.nn.Module):
     """
     univariate version with error variance
     """
-    def __init__(self, blocks: t.nn.ModuleList, blocks_var: t.nn.ModuleList, use_norm: bool = False):
+    def __init__(self, blocks: t.nn.ModuleList, blocks_var: t.nn.ModuleList, use_norm: bool = False, force_positive: bool = False):
         super().__init__()
         self.blocks = blocks
         self.blocks_var = blocks_var
         self.use_norm = use_norm ## variance estimation maybe doesn't get along with windowed normalization?
-
+        self.force_positive = force_positive
+        
     def forward(self, x_raw: t.Tensor, input_mask: t.Tensor, static_cat: Optional[t.Tensor] = None, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
         ## normalize by window
         if self.use_norm:
-            norm = x_raw.mean(dim=1,keepdim=True) # .median(dim=1,keepdim=True).values # 
+            norm = x_raw.median(dim=1,keepdim=True).values + 1e-6 #x_raw.mean(dim=1,keepdim=True) + 1e-6 #
             x = x_raw / norm
         else:
             x = x_raw.clone()
@@ -232,9 +233,6 @@ class NBeats_var(t.nn.Module):
             residuals = (residuals - backcast) * input_mask
             forecast = forecast + block_forecast
 
-        if self.use_norm:
-            forecast = forecast * norm ## denormalize
-        
         ## try using final residuals to train error var forecast?
         variance_forecast = t.zeros_like(forecast)
 
@@ -247,9 +245,19 @@ class NBeats_var(t.nn.Module):
             variance_forecast = variance_forecast + block_forecast
             
         ## variance must be positive, so softplus at the end?
-        variance_forecast = t.nn.functional.softplus(variance_forecast)
+        variance_forecast = t.nan_to_num(t.nn.functional.softplus(variance_forecast))
+        #variance_forecast = t.nn.functional.softplus(variance_forecast)
 
+        ## maybe forecast must be positive too?
+        if self.force_positive:
+            forecast = t.nan_to_num(t.nn.functional.softplus(forecast))
+            #forecast = t.nn.functional.softplus(forecast)
+        else:
+            forecast = t.nan_to_num(forecast)
+
+        ## must denormalize after softplus, not before
         if self.use_norm:
+            forecast = forecast * norm
             variance_forecast = variance_forecast * norm * norm
 
         ## return both; the loss fn will decide what to do with them
@@ -309,12 +317,13 @@ class NB_dec_var(t.nn.Module):
     estimates error variance
     """
 
-    def __init__(self, blocks: t.nn.ModuleList, blocks_var: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = False):
+    def __init__(self, blocks: t.nn.ModuleList, blocks_var: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = False, force_positive: bool = False):
         super().__init__()
         self.blocks = blocks
         self.blocks_var = blocks_var
         self.exog_block = exog_block  ## just an encoder
         self.use_norm = use_norm ## variance estimation maybe doesn't get along with windowed normalization?
+        self.force_positive = force_positive
 
     def forward(self, all_vars: t.Tensor, input_mask: t.Tensor, static_cat: t.Tensor, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
         x_raw = all_vars[:,:,0] ## first variable is the forecast target; rest are exogenous covariates
@@ -322,7 +331,7 @@ class NB_dec_var(t.nn.Module):
         ## normalize by window
         ## covars should be normalized at the dataset level (by window doesn't make sense)
         if self.use_norm:
-            norm = x_raw.mean(dim=1,keepdim=True) #.median(dim=1,keepdim=True).values
+            norm = x_raw.median(dim=1,keepdim=True).values + 1e-6 #x_raw.mean(dim=1,keepdim=True) + 1e-6 #
             x = x_raw / norm
         else:
             x = x_raw.clone()
@@ -341,9 +350,6 @@ class NB_dec_var(t.nn.Module):
             residuals = (residuals - backcast) * input_mask
             forecast = forecast + block_forecast
 
-        if self.use_norm:
-            forecast = forecast * norm ## denormalize
-
         ## try using final "residuals" to train error var forecast?
         variance_forecast = t.zeros_like(forecast)
 
@@ -354,11 +360,21 @@ class NB_dec_var(t.nn.Module):
             backcast, block_forecast = block(residuals)
             residuals = (residuals - backcast) * input_mask
             variance_forecast = variance_forecast + block_forecast
-            
-        ## variance must be positive, so softplus at the end?
-        variance_forecast = t.nn.functional.softplus(variance_forecast)
 
+        ## variance must be positive, so softplus at the end?
+        variance_forecast = t.nan_to_num(t.nn.functional.softplus(variance_forecast))
+        #variance_forecast = t.nn.functional.softplus(variance_forecast)
+
+        ## maybe forecast must be positive too?
+        if self.force_positive:
+            forecast = t.nan_to_num(t.nn.functional.softplus(forecast))
+            #forecast = t.nn.functional.softplus(forecast)
+        else:
+            forecast = t.nan_to_num(forecast)
+
+        ## must denormalize after softplus, not before
         if self.use_norm:
+            forecast = forecast * norm 
             variance_forecast = variance_forecast * norm * norm
 
         ## return both; the loss fn will decide what to do with them
