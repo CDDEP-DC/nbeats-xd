@@ -116,17 +116,21 @@ def t_nll_loss(forecast_mu, target, variance):
     m = StudentT(n, forecast_mu, s)
     return -1.0 * t.mean(t.sum(m.log_prob(target),dim=1))
 
-#def gamma_nll_loss(forecast_mu, target, variance):
-#    eps = 1e-6
-#    mu = forecast_mu + eps #t.nan_to_num(forecast_mu,1e-6) + eps
-#    s2 = variance + eps #t.nan_to_num(variance,1e-6) + eps
-#    mu2 = forecast_mu * forecast_mu + eps #t.nan_to_num(mu*mu,1e-6) + eps
-#    targ = target + eps ## must not be 0
-#    ## a = mu^2/var; b = mu/var
-#    a = mu2 / s2 
-#    b = mu / s2
-#    m = Gamma(a,b)
-#    return -1.0 * t.nanmean(t.nansum(m.log_prob(targ),dim=1))
+## gamma is a continuous approximation to the negative binomial dist.
+## which is like an overdispersed Poisson, so it works for count data
+## (note: the approximation is bad for small counts, especially zeros)
+## (also note: this predicts a probability distribution, not the future
+## value directly. Because the dist is skewed, the likelihood is maximized
+## when the predicted mean and median are higher than the observed data.)
+def gamma_nll_loss(forecast_mu, target, variance):
+    adj_targ = target + 0.5 ## prevents 0's in the data from hurting the model as much
+    ## alpha = mu^2/var; beta = mu/var
+    eps = 1e-4
+    b = forecast_mu / (variance + eps)
+    a = forecast_mu * b
+    m = Gamma(a+eps,b+eps) ## not good if a or b are too close to 0
+    p = t.nan_to_num(m.log_prob(adj_targ),-1e6) ## nans are bad, but don't let them crash the run
+    return -1.0 * t.mean(t.sum(p,dim=1))
     
 #def cauchy_nll_loss(forecast_mu, target, s):
 #    m = Cauchy(forecast_mu, s)
@@ -143,6 +147,8 @@ def __ll_fn(loss_name: str):
         return t_nll_loss
     elif loss_name == 'norm_nll':
         return t.nn.functional.gaussian_nll_loss
+    elif loss_name == 'gamma_nll':
+        return gamma_nll_loss
     else:
         raise Exception(f'Unknown loss function: {loss_name}')
 

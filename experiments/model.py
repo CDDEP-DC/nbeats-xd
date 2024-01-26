@@ -68,14 +68,15 @@ def generic_decoder(enc_dim: int, output_size: int, stacks: int, layers: int, la
 
 
 def generic_dec_var(enc_dim: int, output_size: int, stacks: int, layers: int, layer_size: int,
-                    exog_block: t.nn.Module, use_norm: bool = False, dropout: Optional[float] = None):
+                    exog_block: t.nn.Module, use_norm: bool = False, dropout: Optional[float] = None,
+                    force_positive: bool = False):
     """
     Create N-BEATS decoder model for covariates with error variance forecasting
     """
     return NB_dec_var(generic_block(enc_dim, output_size, stacks, layers, layer_size, dropout),
                         ## use same architecture for variance
                         generic_block(enc_dim, output_size, stacks, layers, layer_size, dropout),
-                        exog_block, use_norm)
+                        exog_block, use_norm, force_positive)
 
 
 
