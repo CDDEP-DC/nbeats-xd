@@ -32,6 +32,13 @@ def default_device() -> t.device:
     ## if no gpu:
     #return t.device('cpu')
 
+def empty_gpu_cache():
+    ## if mac metal gpu:
+    t.mps.empty_cache()
+    ## if other gpu:
+    #t.cuda.empty_cache()
+    return None
+
 def to_tensor(array: np.ndarray) -> t.Tensor:
     """
     Convert numpy array to tensor on default device.

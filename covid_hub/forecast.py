@@ -3,11 +3,10 @@
 # https://creativecommons.org/licenses/by-nc/4.0/. 
 
 import os
-import io
-import sys
 import shutil
 import datetime
-import requests
+import pickle
+from copy import deepcopy
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -17,6 +16,7 @@ from torch.utils.data import DataLoader
 from scipy import stats
 import matplotlib.pyplot as plt
 
+from common.torch.ops import empty_gpu_cache
 from common.sampler import ts_dataset
 from common.torch.snapshots import SnapshotManager
 from experiments.trainer import trainer_var
@@ -25,7 +25,7 @@ from models.exog import LSTM_test, TCN_encoder
 
 class Struct:
     def __init__(self, **entries): self.__dict__.update(entries)
-    def __repr__(self): return '\n'.join([f"{k}: {v}" for (k,v) in vars(self).items()])
+    def __repr__(self): return '\n'.join([f"{k} = {v}" for (k,v) in vars(self).items()])
 
 
 def default_settings():
@@ -40,8 +40,8 @@ def default_settings():
     settings.batch_size = 256 #128 #1024 #
 
     ## ensemble using these options:
-    settings.lookback_opts = [3,4,4,5,5,6,7]#[3,3,4,4,5,5,6,6,7,7]#  ## backward window size, in horizons
-    settings.use_cat_opts = [False] ## whether to use static_cat; current implementation always makes forecasts worse
+    settings.lookback_opts = [3,4,5,6] #prev: [3,4,4,5,5,6,7] #  ## backward window size, in horizons
+    settings.random_reps = 5 ## times to repeat each lookback opt
 
     ## forecast horizon (in time units)
     settings.horizon = 40 #6
@@ -51,35 +51,44 @@ def default_settings():
     ##  ("3ma" = 3 day centered MA -- intended to smoothe out reporting errors without losing too much variance)
     settings.data_suffix = "3ma" #"7ma" #"weekly" #"unsmoothed" #
     settings.targ_var = "h_mean" if settings.data_suffix=="weekly" else "h" #"h_log" # 
+    ## let's try sqrt transform?
+    settings.sqrt_transform = True
     ## loss function (defined in experiments/trainer.py)
-    settings.lfn_name = "t_nll" # "norm_nll" if targ_var=="h_log" else "t_nll" #
+    settings.lfn_name = "t_nll" 
     settings.force_positive_forecast = False ## if loss fn requires > 0
+    settings.model_prefix = "t_sqrt" # for output file names
 
     settings.normalize_target = False ## normalize the target var before passing to model? (see notes below)
     settings.use_windowed_norm = True ## normalize inside the model by window? (tends to improve forecasts; ref. Smyl 2020)
+    settings.use_static_cat = False ## whether to use static_cat; current implementation always makes forecasts worse
 
     ## which covariates to include (including useless ones hinders learning)
-    settings.exog_vars = ["doy","dewpC","vacc_rate"]
+    settings.exog_vars = ['doy','vacc_rate'] #prev: ["doy","dewpC","vacc_rate"]
 
     settings.nbeats_stacks=12 #8 # more data can support deeper model
     settings.nbeats_hidden_dim=512 #128 ## should be larger than length of lookback window
     settings.nbeats_dropout=0.2 ## could help prevent overfitting? default = None
-    settings.encoder_k = 4 #3
-    #settings.encoder_n = 5 #4 ## TCN receptive field size = 2(k-1)(2^n - 1)+1
+    settings.encoder_k = 5 #prev: 4 (5 always better)  ## TCN receptive field size = 2(k-1)(2^n - 1)+1
     settings.encoder_hidden_dim=128
     settings.encoder_dropout=0.2 ## default is 0.2
 
-    ## if we're using weekly or 7-day moving average to forecast daily values,
-    ## the daily variance is 7 * that of the weekly means or smoothed data
-    ## (set this to 1.0 if we used actual daily data, or if we want confidence intervals for weekly means)
-    ##  (also: this relationship breaks down for log-transformed data)
-    settings.variance_scale = 7.0 if (settings.data_suffix=="weekly" or settings.data_suffix=="7ma") else 1.0
-    settings.data_is_log = (settings.targ_var=="h_log")
-
     ## quantiles requested by forecast hub
     settings.qtiles = [0.01, 0.025, *np.linspace(0.05, 0.95, 19).round(2), 0.975, 0.99]
-
+    ## keep models?
+    settings.delete_models = False
     return settings
+
+
+## path where to save model snapshots (warning, this directory is optionally deleted)
+def model_directory():
+    return "hub_model_snapshots"
+
+def delete_saved_models():
+    try:
+        shutil.rmtree(model_directory())
+    except:
+        pass
+    return None
 
 
 ## this fn returns a function suitable for using in a loop to generate an ensemble
@@ -159,7 +168,7 @@ def make_training_fn(training_data: Dict[str, np.ndarray],
 
         training_set = DataLoader(train_ds,batch_size=batch_size)
 
-        snapshot_manager = SnapshotManager(snapshot_dir=os.path.join('hub_model_snapshots', model_name),
+        snapshot_manager = SnapshotManager(snapshot_dir=os.path.join(model_directory(), model_name),
                                             total_iterations=iterations)
 
         ## training loop, including loss fn; defined in experiments/trainer.py
@@ -177,10 +186,90 @@ def make_training_fn(training_data: Dict[str, np.ndarray],
     return ret_fn
 
 
+def ensemble_loop(rstate, settings):
+
+    ## create training function
+    training_fn = make_training_fn(training_data = rstate.vals_train,
+                            static_categories = rstate.static_cat,
+                            target_key = rstate.target_key,
+                            horizon = settings.horizon,
+                            windowed_norm = settings.use_windowed_norm,
+                            init_LR = settings.init_LR,
+                            batch_size = settings.batch_size)
+
+    mu_fc={}
+    var_fc={}
+    for i,lookback in enumerate(settings.lookback_opts):
+        for j in range(settings.random_reps):
+            model_name = settings.model_prefix+"_"+str(lookback)+"_"+str(j)
+            model_suffix = str(rstate.cut) if rstate.cut is not None else str(rstate.data_index[-1])
+            model_name = model_name+"_"+model_suffix
+            print("training ",model_name)
+            mu_fc[model_name], var_fc[model_name] = training_fn(model_name = model_name,
+                                                                iterations = settings.iterations,
+                                                                lookback = lookback,
+                                                                use_exog_vars = settings.exog_vars,
+                                                                use_static_cat = settings.use_static_cat,
+                                                                loss_fn_name = settings.lfn_name,
+                                                                nbeats_stacks = settings.nbeats_stacks,
+                                                                nbeats_hidden_dim = settings.nbeats_hidden_dim,
+                                                                nbeats_dropout = settings.nbeats_dropout,
+                                                                encoder_k = settings.encoder_k,
+                                                                #encoder_n=None, ## auto calculated
+                                                                encoder_hidden_dim = settings.encoder_hidden_dim,
+                                                                encoder_dropout = settings.encoder_dropout,
+                                                                force_positive_forecast = settings.force_positive_forecast) 
+
+    ## forecast shape for each model is [series, time]
+    ## ensemble using median across models
+    mu_fc["median"] = np.median(np.stack([mu_fc[k] for k in mu_fc]),axis=0)
+    var_fc["median"] = np.median(np.stack([var_fc[k] for k in var_fc]),axis=0)
+
+    ## write results to state
+    rstate.mu_fc = mu_fc
+    rstate.var_fc = var_fc
+    return None
+
+
+def generate_ensemble(settings, cut):
+
+    empty_gpu_cache()
+    ## clean state for current run:
+    rstate = Struct()
+    ## record a copy of settings used for this run
+    rstate.settings = deepcopy(settings)
+
+    load_training(rstate, settings, cut)
+    normalize_training(rstate, settings)
+    ensemble_loop(rstate, settings)
+    generate_quantiles(rstate, settings)
+
+    ## return struct containing results
+    return rstate
+
+
+def run_tests(settings, test_cut_vals, forecast_delay_days):
+    for (cut,forecast_delay) in zip(test_cut_vals, forecast_delay_days):
+        rstate = generate_ensemble(settings, cut)
+        pickle_results(rstate)
+        output_figs(rstate)
+        output_csv(rstate, forecast_delay)
+        if settings.delete_models:
+            delete_saved_models()
+    empty_gpu_cache()
+    return None
+
+
 def load_training(rstate, settings, cut):
     targ_var = settings.targ_var
-    data_is_log = settings.data_is_log
     data_suffix = settings.data_suffix
+
+    rstate.data_is_log = (targ_var=="h_log")
+    ## if we're using weekly or 7-day moving average to forecast daily values,
+    ## the daily variance is 7 * that of the weekly means or smoothed data
+    ## (set this to 1.0 if we used actual daily data, or if we want confidence intervals for weekly means)
+    ##  (also: this relationship breaks down for log-transformed data)
+    rstate.variance_scale = 7.0 if (data_suffix=="weekly" or data_suffix=="7ma") else 1.0
 
     ## load training data
     df_targ_all = pd.read_csv("storage/training_data/"+targ_var+"_"+data_suffix+".csv",index_col=0)
@@ -188,15 +277,15 @@ def load_training(rstate, settings, cut):
     data_index = df_targ.index
     data_columns = df_targ.columns
 
-    vals_train = {}
-    vals_train[targ_var] = df_targ.to_numpy(dtype=np.float32).transpose() ## dims are [series, time]
-
     if cut is not None:
         test_targets = df_targ_all.iloc[cut:,:].to_numpy(dtype=np.float32).transpose()
     else:
         test_targets = None
 
-    if data_is_log: # used log data
+    vals_train = {}
+    vals_train[targ_var] = df_targ.to_numpy(dtype=np.float32).transpose() ## dims are [series, time]
+
+    if rstate.data_is_log: # read in log data
         vals_train["nat_scale"] = np.exp(vals_train[targ_var]) - 1.0
         test_targets = np.exp(test_targets) - 1.0 if test_targets is not None else None
     else:
@@ -329,9 +418,15 @@ def normalize_training(rstate, settings):
         if k in vals_train:
             vals_train[k] = 2.0 * vals_train[k] / np.nanmax(vals_train[k])
 
+    ## read in nat scale data, but want to sqrt transform it
+    if settings.sqrt_transform and not rstate.data_is_log: ## ignore setting if data is log-transformed
+        vals_train[targ_var] = np.sqrt(vals_train[targ_var])
+        rstate.data_is_sqrt = True
+    else:
+        rstate.data_is_sqrt = False
+
     ## optionally normalize the target
     if normalize_target:
-        ## (note: don't log transform the processed data; load log data instead)
         ## try transforming series to common scale
         ## NOTE: in the unscaled data, series with small values contribute less to the weight gradients
         ##  scaling makes the model learn better from states with small populations, whose data is noisier and more error prone
@@ -348,40 +443,6 @@ def normalize_training(rstate, settings):
     return None
   
 
-def ensemble_loop(rstate, settings):
-    training_fn = rstate.training_fn
-    mu_fc={}
-    var_fc={}
-    for i,lookback in enumerate(settings.lookback_opts):
-        for j,use_static_cat in enumerate(settings.use_cat_opts):
-            model_name = settings.lfn_name+"_"+str(i)+"_"+str(int(use_static_cat))
-            model_name = model_name+"_"+str(rstate.cut) if rstate.cut is not None else model_name
-            print("training ",model_name)
-            mu_fc[model_name], var_fc[model_name] = training_fn(model_name = model_name,
-                                                                iterations = settings.iterations,
-                                                                lookback = lookback,
-                                                                use_exog_vars = settings.exog_vars,
-                                                                use_static_cat = use_static_cat,
-                                                                loss_fn_name = settings.lfn_name,
-                                                                nbeats_stacks = settings.nbeats_stacks,
-                                                                nbeats_hidden_dim = settings.nbeats_hidden_dim,
-                                                                nbeats_dropout = settings.nbeats_dropout,
-                                                                encoder_k = settings.encoder_k,
-                                                                #encoder_n=None, ## auto calculated
-                                                                encoder_hidden_dim = settings.encoder_hidden_dim,
-                                                                encoder_dropout = settings.encoder_dropout,
-                                                                force_positive_forecast = settings.force_positive_forecast) 
-
-    ## forecast shape for each model is [series, time]
-    ## ensemble using median across models
-    mu_fc["median"] = np.median(np.stack([mu_fc[k] for k in mu_fc]),axis=0)
-    var_fc["median"] = np.median(np.stack([var_fc[k] for k in var_fc]),axis=0)
-
-    ## write results to state
-    rstate.mu_fc = mu_fc
-    rstate.var_fc = var_fc
-    return None
-
 
 def inverse_cdf(mu, s2, qtiles, lfn_name):
     if lfn_name == "t_nll": ## df hardcoded in experiments/trainer.py
@@ -389,11 +450,16 @@ def inverse_cdf(mu, s2, qtiles, lfn_name):
     elif lfn_name == "norm_nll":
         return [stats.norm.ppf(q=x,loc=mu,scale=np.sqrt(s2)) for x in qtiles]
     elif lfn_name == "gamma_nll":
-        return [stats.gamma.ppf(q=x, a=(mu*mu/s2) , scale=(s2/mu)) for x in qtiles]
+        ## gamma for counts breaks down near 0
+        m = np.maximum(mu, 0.5)
+        v = np.maximum(s2, 0.1)
+        return [stats.gamma.ppf(q=x, a=(m*m/v) , scale=(v/m)) for x in qtiles]
 
 def generate_quantiles(rstate, settings):
     qtiles = settings.qtiles
-    variance_scale = settings.variance_scale
+    data_is_log = rstate.data_is_log ## read only
+    data_is_sqrt = rstate.data_is_sqrt ## read only
+    variance_scale = rstate.variance_scale ## read only
     inv_scale = rstate.inv_scale ## read only
     mu_fc = rstate.mu_fc ## read only
     var_fc = rstate.var_fc ## read only
@@ -415,32 +481,54 @@ def generate_quantiles(rstate, settings):
         mu = mu_fc[k] * inv_scale
         s2 = var_fc[k] * variance_scale * inv_scale * inv_scale
 
-        ## TODO
-        ## - multiply covar mat by forecast_i_j before summing to get estimated nat scale covar
-        ## - un-transform mu before summing
-        if settings.data_is_log:
-            pass
+        ## inverse-transform the estimates
+        ## don't need to inv-trans the variance, because we'll inv-trans the quantiles directly
+        ##   (that won't work for the sum though, see below)
+        if data_is_log:
+            mu_nat = np.exp(mu) - 1.0
+        elif data_is_sqrt:
+            mu_nat = np.square(mu)
+        else:
+            mu_nat = mu
 
-        sum_mu = np.nansum(mu,axis=0,keepdims=True)  ## sum(natural scale mu)
-        ## covar_i_j = correlation_i_j * std_i * std_j
-        st_devs = np.sqrt(s2)
-        ## var(sum) = sum(covar) at each timepoint for which variance was forecast
-        sum_s2 = np.array([np.nansum(corr_mat * st_devs[:,i,None] * st_devs[:,i]) for i in range(st_devs.shape[1])])
+        sum_mu = np.nansum(mu_nat, axis=0, keepdims=True)  ## sum(natural scale mu)
+        st_devs = np.sqrt(s2) ## needed for var(sum) below
+
+        if data_is_log:
+            ## approximate variance on natural scale: var(x) ~~ mu_x * var(log(x)) * mu_x
+            sum_s2 = np.array([np.nansum(corr_mat * st_devs[:,i,None] * st_devs[:,i] * mu_nat[:,i,None] * mu_nat[:,i]) for i in range(st_devs.shape[1])])
+        elif data_is_sqrt:
+            ## delta method: var(f(x)) ~~ f'(mu) * var(x) * f'(mu) -> var(x^2) ~~ 2mu * var(x) * 2mu
+            sum_s2 = np.array([np.nansum(corr_mat * st_devs[:,i,None] * st_devs[:,i] * 4.0 * mu[:,i,None] * mu[:,i]) for i in range(st_devs.shape[1])])
+        else:
+            ## var(sum) = sum(covar) at each timepoint for which variance was forecast
+            ## covar_i_j = correlation_i_j * std_i * std_j
+            sum_s2 = np.array([np.nansum(corr_mat * st_devs[:,i,None] * st_devs[:,i]) for i in range(st_devs.shape[1])])
 
         ##
         ## try using gamma err dist, even if trained on a different error fn?
         ##
-        fc_quantiles[k] = np.stack(inverse_cdf(mu, s2, qtiles, "gamma_nll"), #gen_qtiles(mu, s2, qtiles, settings.lfn_name), 
-                                   axis=2) ## [series, time, quantiles]
-        us_quantiles[k] = np.stack(inverse_cdf(sum_mu, sum_s2, qtiles, "gamma_nll"),
-                                   axis=2)
-        
-        fc_med[k],fc_upper[k],fc_lower[k] = inverse_cdf(mu, s2, [0.5,0.975,0.025], "gamma_nll") #gen_qtiles(mu, s2, [0.5,0.975,0.025], settings.lfn_name)
-        us_med[k],us_upper[k],us_lower[k] = inverse_cdf(sum_mu, sum_s2, [0.5,0.975,0.025], "gamma_nll")
+        if data_is_log:
+            err_name = settings.lfn_name
+        else:
+            err_name = "gamma_nll"
 
-        ## TODO -- convert fc_*[k] to natural scale
-        if settings.data_is_log:
-            pass
+        ## note, sum(mu) and var(sum) were converted to nat scale above
+        fc_quantiles[k] = np.stack(inverse_cdf(mu, s2, qtiles, err_name), axis=2) ## [series, time, quantiles]
+        us_quantiles[k] = np.stack(inverse_cdf(sum_mu, sum_s2, qtiles, err_name), axis=2)
+        fc_med[k],fc_upper[k],fc_lower[k] = inverse_cdf(mu, s2, [0.5,0.975,0.025], err_name)
+        us_med[k],us_upper[k],us_lower[k] = inverse_cdf(sum_mu, sum_s2, [0.5,0.975,0.025], err_name)
+
+        if data_is_log:
+            fc_quantiles[k] = np.exp(fc_quantiles[k]) - 1.0
+            fc_med[k] = np.exp(fc_med[k]) - 1.0
+            fc_upper[k] = np.exp(fc_upper[k]) - 1.0
+            fc_lower[k] = np.exp(fc_lower[k]) - 1.0
+        elif data_is_sqrt:
+            fc_quantiles[k] = np.square(fc_quantiles[k])
+            fc_med[k] = np.square(fc_med[k])
+            fc_upper[k] = np.square(fc_upper[k])
+            fc_lower[k] = np.square(fc_lower[k])
 
     ## write results to state
     rstate.fc_quantiles = fc_quantiles
@@ -471,26 +559,42 @@ def plotpred(forecasts, name, ser, training_targets, test_targets, horizon, lowe
         ax.fill_between(dates[x_end:x_end+horizon],lower_fc[name][ser],upper_fc[name][ser],color=colors[1],alpha=0.4)
     #plt.show()
 
-
-def output_figs(rstate, settings):
-    horizon = settings.horizon
+def output_figs(rstate):
+    horizon = rstate.settings.horizon
     vals_train = rstate.vals_train ## read only
     test_targets = rstate.test_targets ## read only
+    model_prefix = rstate.settings.model_prefix ## read only
 
     us_train = vals_train["nat_scale"].sum(axis=0,keepdims=True)
     us_test = test_targets.sum(axis=0,keepdims=True) if test_targets is not None else None
-    plotpred(rstate.fc_med, "median", 20, vals_train["nat_scale"], test_targets, horizon, rstate.fc_lower, rstate.fc_upper, rstate.cut-400)
-    plt.savefig("storage/gamma_MD_"+str(rstate.cut)+".png")
-    plotpred(rstate.fc_med, "median", 4, vals_train["nat_scale"], test_targets, horizon, rstate.fc_lower, rstate.fc_upper, rstate.cut-400)
-    plt.savefig("storage/gamma_CA_"+str(rstate.cut)+".png")
-    plotpred(rstate.us_med, "median", 0, us_train, us_test, horizon, rstate.us_lower, rstate.us_upper, rstate.cut-400)
-    plt.savefig("storage/gamma_US_"+str(rstate.cut)+".png")
+    x0 = rstate.cut - 400 if rstate.cut is not None else vals_train["nat_scale"].shape[1] - 400
+    model_suffix = str(rstate.cut) if rstate.cut is not None else str(rstate.data_index[-1])
+
+    plotpred(rstate.fc_med, "median", 20, vals_train["nat_scale"], test_targets, horizon, rstate.fc_lower, rstate.fc_upper, x0)
+    plt.savefig("storage/"+model_prefix+"_MD_"+model_suffix+".png")
+    plotpred(rstate.fc_med, "median", 4, vals_train["nat_scale"], test_targets, horizon, rstate.fc_lower, rstate.fc_upper, x0)
+    plt.savefig("storage/"+model_prefix+"_CA_"+model_suffix+".png")
+    plotpred(rstate.us_med, "median", 0, us_train, us_test, horizon, rstate.us_lower, rstate.us_upper, x0)
+    plt.savefig("storage/"+model_prefix+"_US_"+model_suffix+".png")
     return None
 
 
+def pickle_results(rstate):
+    model_prefix = rstate.settings.model_prefix
+    model_suffix = str(rstate.cut) if rstate.cut is not None else str(rstate.data_index[-1])
+    path = "storage/"+model_prefix+"_"+model_suffix+".pickle"
+    with open(path,"wb") as f:
+        pickle.dump(rstate, f)
+
+def read_pickle(path):
+    with open(path,"rb") as f:
+        r = pickle.load(f)
+    return r
+
+
 ## process data for forecast hub
-def output_csv(rstate, settings, forecast_delay):
-    qtiles = settings.qtiles
+def output_csv(rstate, forecast_delay):
+    qtiles = rstate.settings.qtiles
     data_index = rstate.data_index
     data_columns = rstate.data_columns
     fc_quantiles = rstate.fc_quantiles
