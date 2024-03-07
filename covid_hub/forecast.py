@@ -37,7 +37,7 @@ def default_settings():
     ## batch size?
     ## nbeats is ok with large batch size, but it seems to hurt TCN
     ## the two parts probably learn at different rates; not sure how to handle that
-    settings.batch_size = 256 #128 #1024 #
+    settings.batch_size = 128 #256 #128 #1024 #
 
     ## ensemble using these options:
     settings.lookback_opts = [3,4,5,6] #prev: [3,4,4,5,5,6,7] #  ## backward window size, in horizons
@@ -63,9 +63,9 @@ def default_settings():
     settings.use_static_cat = False ## whether to use static_cat; current implementation always makes forecasts worse
 
     ## which covariates to include (including useless ones hinders learning)
-    settings.exog_vars = ['doy','vacc_rate'] #prev: ["doy","dewpC","vacc_rate"]
+    settings.exog_vars = ['doy','dewpC'] #['doy','vacc_rate'] #prev: ["doy","dewpC","vacc_rate"]
 
-    settings.nbeats_stacks=12 #8 # more data can support deeper model
+    settings.nbeats_stacks=8 #12 #8 # more data can support deeper model
     settings.nbeats_hidden_dim=512 #128 ## should be larger than length of lookback window
     settings.nbeats_dropout=0.2 ## could help prevent overfitting? default = None
     settings.encoder_k = 5 #prev: 4 (5 always better)  ## TCN receptive field size = 2(k-1)(2^n - 1)+1
