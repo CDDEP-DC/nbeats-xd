@@ -6,7 +6,7 @@ import numpy as np
 import torch as t
 import random
 from common.torch.ops import default_device
-#from models.nbeats import GenericBasis, NBeats, NBeatsBlock
+from models.nbeats import GenericBasis, NBeats, NBeatsBlock
 from typing import Tuple, Optional
 
 

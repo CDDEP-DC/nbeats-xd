@@ -1,0 +1,7 @@
+{
+"iterations": 400,
+"init_LR": 0.00025,
+"batch_size": 128,
+"lookback": 4,
+"horizon": 40
+}

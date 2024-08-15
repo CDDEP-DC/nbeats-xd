@@ -24,13 +24,6 @@ def default_device() -> t.device:
 
     :return: Default device.
     """
-    #return t.device('cuda' if t.cuda.is_available() else 'cpu')
-    ## if mac metal gpu:
-    #return t.device('mps') 
-    ## if other gpu:
-    #return t.device('cuda')
-    ## if no gpu:
-    #return t.device('cpu')
     if t.backends.mps.is_available():
         return t.device('mps')
     elif t.cuda.is_available():
@@ -39,14 +32,12 @@ def default_device() -> t.device:
         return t.device('cpu')
 
 def empty_gpu_cache():
-    ## if mac metal gpu:
-    #t.mps.empty_cache()
-    ## if other gpu:
-    #t.cuda.empty_cache()
     if t.backends.mps.is_available():
         t.mps.empty_cache()
     elif t.cuda.is_available():
         t.cuda.empty_cache()
+    else:
+        pass
     return None
 
 def to_tensor(array: np.ndarray) -> t.Tensor:

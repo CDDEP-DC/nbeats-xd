@@ -105,7 +105,6 @@ class SeasonalityBasis(t.nn.Module):
 class NBeatsBlock(t.nn.Module):
     """
     N-BEATS block which takes a basis function as an argument.
-    as in original model, but with optional dropout
     """
     def __init__(self,
                  input_size: int,
@@ -151,28 +150,7 @@ class NBeatsBlock(t.nn.Module):
         return self.basis_function(basis_parameters)
 
 
-class NBeats_stack(t.nn.Module):
-    """
-    doubly-residual stack of nbeatsblock, as in original paper
-    option to force positive output (so this can be used to forecast variance, below)
-    """
-    def __init__(self, blocks: t.nn.ModuleList, force_positive: bool = False):
-        super().__init__()
-        self.blocks = blocks
-        self.force_positive = force_positive
 
-    def forward(self, residuals: t.Tensor, forecast: t.Tensor, input_mask: t.Tensor):
-        for i, block in enumerate(self.blocks):
-            backcast, block_forecast = block(residuals)
-            residuals = (residuals - backcast) * input_mask
-            forecast = forecast + block_forecast
-
-        if self.force_positive:
-            forecast = t.nan_to_num(t.nn.functional.softplus(forecast))
-        else:
-            forecast = t.nan_to_num(forecast)
-
-        return (residuals, forecast)
 
 
 class NBeats_orig(t.nn.Module):
@@ -181,23 +159,27 @@ class NBeats_orig(t.nn.Module):
     """
     def __init__(self, blocks: t.nn.ModuleList):
         super().__init__()
-        self.nbeats = NBeats_stack(blocks)
+        self.blocks = blocks
 
     def forward(self, x: t.Tensor, input_mask: t.Tensor, static_cat: Optional[t.Tensor] = None, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
-        residuals = x.flip(dims=(1,)) ## passing x to the network in reverse (does this make a difference?)
+        residuals = x.flip(dims=(1,))
         input_mask = input_mask.flip(dims=(1,))
         forecast = x[:, -1:]  ### the last element in each series is the "level"; each block's forecast adds to it 
-        (residuals, forecast) = self.nbeats(residuals, forecast, input_mask)
+        for i, block in enumerate(self.blocks):
+            backcast, block_forecast = block(residuals)
+            residuals = (residuals - backcast) * input_mask
+            forecast = forecast + block_forecast
+
         return forecast
 
 
-class NBeats_wnorm(t.nn.Module):
+class NBeats(t.nn.Module):
     """
     N-Beats Model, but with optional windowed normalization; univariate
     """
     def __init__(self, blocks: t.nn.ModuleList, use_norm: bool = True):
         super().__init__()
-        self.nbeats = NBeats_stack(blocks)
+        self.blocks = blocks
         self.use_norm = use_norm ## seems to improve forecasts
 
     def forward(self, x_raw: t.Tensor, input_mask: t.Tensor, static_cat: Optional[t.Tensor] = None, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
@@ -208,10 +190,14 @@ class NBeats_wnorm(t.nn.Module):
         else:
             x = x_raw.clone()
 
-        residuals = x.flip(dims=(1,)) ## passing x to the network in reverse (does this make a difference?)
+        residuals = x.flip(dims=(1,))
         input_mask = input_mask.flip(dims=(1,))
         forecast = x[:, -1:]  ### the last element in each series is the "level"; each block's forecast adds to it 
-        (residuals, forecast) = self.nbeats(residuals, forecast, input_mask)
+
+        for i, block in enumerate(self.blocks):
+            backcast, block_forecast = block(residuals)
+            residuals = (residuals - backcast) * input_mask
+            forecast = forecast + block_forecast
 
         if self.use_norm:
             return forecast * norm ## denormalize
@@ -225,9 +211,10 @@ class NBeats_var(t.nn.Module):
     """
     def __init__(self, blocks: t.nn.ModuleList, blocks_var: t.nn.ModuleList, use_norm: bool = False, force_positive: bool = False):
         super().__init__()
-        self.nbeats = NBeats_stack(blocks, force_positive) ## force forecast to be positive?
-        self.nbeats_var = NBeats_stack(blocks_var, True) ## always force positive variance
+        self.blocks = blocks
+        self.blocks_var = blocks_var
         self.use_norm = use_norm ## variance estimation maybe doesn't get along with windowed normalization?
+        self.force_positive = force_positive
         
     def forward(self, x_raw: t.Tensor, input_mask: t.Tensor, static_cat: Optional[t.Tensor] = None, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
         ## normalize by window
@@ -237,24 +224,45 @@ class NBeats_var(t.nn.Module):
         else:
             x = x_raw.clone()
 
-        residuals = x.flip(dims=(1,)) ## passing x to the network in reverse (does this make a difference?)
+        residuals = x.flip(dims=(1,))
         input_mask = input_mask.flip(dims=(1,))
         forecast = x[:, -1:]  ### the last element in each series is the "level"; each block's forecast adds to it 
-        (residuals, forecast) = self.nbeats(residuals, forecast, input_mask)
+
+        for i, block in enumerate(self.blocks):
+            backcast, block_forecast = block(residuals)
+            residuals = (residuals - backcast) * input_mask
+            forecast = forecast + block_forecast
 
         ## try using final residuals to train error var forecast?
         residuals = t.square(residuals)
-        ## should variance forcast add to final residual, or to zero?
-        variance_forecast = t.zeros_like(forecast)
-        (residuals, variance_forecast) = self.nbeats_var(residuals, variance_forecast, input_mask)
 
-        ## note: must denormalize after softplus, not before
+        ## should variance forcast add to final residual, or to zero?
+        #variance_forecast = residuals[:, -1:]
+        variance_forecast = t.zeros_like(forecast)
+
+        for i, block in enumerate(self.blocks_var):
+            backcast, block_forecast = block(residuals)
+            residuals = (residuals - backcast) * input_mask
+            variance_forecast = variance_forecast + block_forecast
+            
+        ## variance must be positive, so softplus at the end?
+        variance_forecast = t.nan_to_num(t.nn.functional.softplus(variance_forecast))
+
+        ## maybe forecast must be positive too?
+        if self.force_positive:
+            forecast = t.nan_to_num(t.nn.functional.softplus(forecast))
+        else:
+            forecast = t.nan_to_num(forecast)
+
+        ## must denormalize after softplus, not before
         if self.use_norm:
             forecast = forecast * norm
             variance_forecast = variance_forecast * norm * norm
 
         ## return both; the loss fn will decide what to do with them
         return (forecast, variance_forecast)
+
+
 
 
 class NB_decoder(t.nn.Module):
@@ -265,36 +273,41 @@ class NB_decoder(t.nn.Module):
 
     def __init__(self, blocks: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = True):
         super().__init__()
-        self.nbeats = NBeats_stack(blocks)
+        self.blocks = blocks
         self.exog_block = exog_block  ## just an encoder
         self.use_norm = use_norm ## seems to improve forecasts
 
     def forward(self, all_vars: t.Tensor, input_mask: t.Tensor, static_cat: t.Tensor, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
-        ## first variable is the forecast target; rest are exogenous covariates
-        x_raw = all_vars[:,:,0]
-        covars = all_vars.clone() ## exog block also gets the target var
+        x_raw = all_vars[:,:,0] ## first variable is the forecast target; rest are exogenous covariates
 
         ## normalize target by window median
         ## covars should be normalized at the dataset level (by window doesn't make sense)
         if self.use_norm:
             norm = x_raw.median(dim=1,keepdim=True).values
             x = x_raw / norm
-            covars[:,:,0] = x ## replace with normalized
         else:
             x = x_raw.clone()
 
-        ## exog block return sequence = input sequence to nbeats
+        forecast = x[:, -1:]  ### the last element in each series is the "level"; each block's forecast adds to it 
+        covars = all_vars.clone()
+        covars[:,:,0] = x ## replace with normalized
+
         residuals = self.exog_block(covars, static_cat, forecast_target)
 
         residuals = residuals.flip(dims=(1,)) ## passing x to the network in reverse (does this make a difference?)
         input_mask = input_mask.flip(dims=(1,))
-        forecast = x[:, -1:]  ### the last element in each series is the "level"; each block's forecast adds to it 
-        (residuals, forecast) = self.nbeats(residuals, forecast, input_mask)
+        for i, block in enumerate(self.blocks):
+            backcast, block_forecast = block(residuals)
+            residuals = (residuals - backcast) * input_mask
+            forecast = forecast + block_forecast
 
         if self.use_norm:
             return forecast * norm ## denormalize
         else:
             return forecast
+
+
+
 
 
 class NB_dec_var(t.nn.Module):
@@ -305,99 +318,66 @@ class NB_dec_var(t.nn.Module):
 
     def __init__(self, blocks: t.nn.ModuleList, blocks_var: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = False, force_positive: bool = False):
         super().__init__()
-        self.nbeats = NBeats_stack(blocks, force_positive) ## force forecast to be positive?
-        self.nbeats_var = NBeats_stack(blocks_var, True) ## always force positive variance
+        self.blocks = blocks
+        self.blocks_var = blocks_var
         self.exog_block = exog_block  ## just an encoder
         self.use_norm = use_norm ## variance estimation maybe doesn't get along with windowed normalization?
+        self.force_positive = force_positive
 
     def forward(self, all_vars: t.Tensor, input_mask: t.Tensor, static_cat: t.Tensor, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
-        ## first variable is the forecast target; rest are exogenous covariates
-        x_raw = all_vars[:,:,0]
-        covars = all_vars.clone() ## exog block also gets the target var
+        x_raw = all_vars[:,:,0] ## first variable is the forecast target; rest are exogenous covariates
 
         ## normalize by window
         ## covars should be normalized at the dataset level (by window doesn't make sense)
         if self.use_norm:
             norm = x_raw.median(dim=1,keepdim=True).values + 1e-6 #x_raw.mean(dim=1,keepdim=True) + 1e-6 #
             x = x_raw / norm
-            covars[:,:,0] = x ## replace with normalized
         else:
             x = x_raw.clone()
 
-        ## exog block return sequence = input sequence to nbeats
+        forecast = x[:, -1:]  ### the last element in each series is the "level"; each block's forecast adds to it 
+        covars = all_vars.clone()
+        covars[:,:,0] = x ## replace with normalized
+
+        ## initial input to nbeats:
         residuals = self.exog_block(covars, static_cat, forecast_target)
 
         residuals = residuals.flip(dims=(1,)) ## passing x to the network in reverse (does this make a difference?)
         input_mask = input_mask.flip(dims=(1,))
-        forecast = x[:, -1:]  ### the last element in each series is the "level"; each block's forecast adds to it 
-        (residuals, forecast) = self.nbeats(residuals, forecast, input_mask)
+        for i, block in enumerate(self.blocks):
+            backcast, block_forecast = block(residuals)
+            residuals = (residuals - backcast) * input_mask
+            forecast = forecast + block_forecast
 
         ## try using final residuals to train error var forecast?
         residuals = t.square(residuals)
+
         ## should variance forcast add to final residual, or to zero?
+        #variance_forecast = residuals[:, -1:]
         variance_forecast = t.zeros_like(forecast)
-        (residuals, variance_forecast) = self.nbeats_var(residuals, variance_forecast, input_mask)
 
-        ## note: must denormalize after softplus, not before
-        if self.use_norm:
-            forecast = forecast * norm 
-            variance_forecast = variance_forecast * norm * norm
+        for i, block in enumerate(self.blocks_var):
+            backcast, block_forecast = block(residuals)
+            residuals = (residuals - backcast) * input_mask
+            variance_forecast = variance_forecast + block_forecast
 
-        ## return both; the loss fn will decide what to do with them
-        return (forecast, variance_forecast)
+        ## variance must be positive, so softplus at the end?
+        variance_forecast = t.nan_to_num(t.nn.functional.softplus(variance_forecast))
 
-
-class NB2stage(t.nn.Module):
-    """
-    as NB_dec_var, but uses separate stacks for target var and exogenous predictors
-    """
-
-    def __init__(self, blocks1: t.nn.ModuleList, blocks2: t.nn.ModuleList, blocks_var: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = False, force_positive: bool = False):
-        super().__init__()
-        self.nbeats1 = NBeats_stack(blocks1, False)
-        self.nbeats2 = NBeats_stack(blocks2, force_positive) ## force forecast to be positive?
-        self.nbeats_var = NBeats_stack(blocks_var, True) ## always force positive variance
-        self.exog_block = exog_block  ## just an encoder
-        self.use_norm = use_norm ## variance estimation maybe doesn't get along with windowed normalization?
-
-    def forward(self, all_vars: t.Tensor, input_mask: t.Tensor, static_cat: t.Tensor, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
-        ## first variable is the forecast target; rest are exogenous covariates
-        x_raw = all_vars[:,:,0]
-
-        ## normalize by window
-        ## covars should be normalized at the dataset level (by window doesn't make sense)
-        if self.use_norm:
-            norm = x_raw.median(dim=1,keepdim=True).values + 1e-6 #x_raw.mean(dim=1,keepdim=True) + 1e-6 #
-            x = x_raw / norm
+        ## maybe forecast must be positive too?
+        if self.force_positive:
+            forecast = t.nan_to_num(t.nn.functional.softplus(forecast))
         else:
-            x = x_raw.clone()
+            forecast = t.nan_to_num(forecast)
 
-        residuals = x.flip(dims=(1,)) ## passing x to the network in reverse (does this make a difference?)
-        input_mask = input_mask.flip(dims=(1,))
-        forecast = x[:, -1:]  ### the last element in each series is the "level"; each block's forecast adds to it 
-        (residuals, forecast) = self.nbeats1(residuals, forecast, input_mask)
-
-        ## pass residuals from stage 1 along with covars to exog block
-        covars = all_vars.clone() 
-        covars[:,:,0] = residuals
-        ## exog block return sequence = input sequence to nbeats
-        residuals = self.exog_block(covars, static_cat, forecast_target)
-        ## continue adding to forecast
-        (residuals, forecast) = self.nbeats2(residuals, forecast, input_mask)
-
-        ## try using final residuals to train error var forecast?
-        residuals = t.square(residuals)
-        ## should variance forcast add to final residual, or to zero?
-        variance_forecast = t.zeros_like(forecast)
-        (residuals, variance_forecast) = self.nbeats_var(residuals, variance_forecast, input_mask)
-
-        ## note: must denormalize after softplus, not before
+        ## must denormalize after softplus, not before
         if self.use_norm:
             forecast = forecast * norm 
             variance_forecast = variance_forecast * norm * norm
 
         ## return both; the loss fn will decide what to do with them
         return (forecast, variance_forecast)
+
 
 
 

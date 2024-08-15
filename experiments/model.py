@@ -26,7 +26,7 @@ import numpy as np
 import torch as t
 from typing import Optional
 
-from models.nbeats import GenericBasis, NBeats, NBeatsBlock, NBeats_var, NB_decoder, NB_dec_var
+from models.nbeats import GenericBasis, NBeats_wnorm, NBeatsBlock, NBeats_var, NB_decoder, NB_dec_var, NB2stage
 
 def generic_block(input_size: int, output_size: int, stacks: int, layers: int, layer_size: int, dropout: Optional[float] = None):
     return t.nn.ModuleList([NBeatsBlock(input_size=input_size,
@@ -43,7 +43,7 @@ def generic(input_size: int, output_size: int, stacks: int, layers: int, layer_s
     """
     Create N-BEATS generic model. univariate, no error variance
     """
-    return NBeats(generic_block(input_size,output_size,stacks,layers,layer_size,dropout),
+    return NBeats_wnorm(generic_block(input_size,output_size,stacks,layers,layer_size,dropout),
                   use_norm)
 
 

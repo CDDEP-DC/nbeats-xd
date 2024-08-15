@@ -1,0 +1,10 @@
+{
+"target_file": "h_3ma.csv",
+"output_prefix": "test",
+"delete_models": 0,
+"input_is_log": 0,
+"input_is_sqrt": 0,
+"log_transform": 0,
+"sqrt_transform": 1,
+"variance_scale": 1.0
+}

@@ -133,4 +133,7 @@ class SnapshotManager:
         t.save(data, temp_file)
         temp_file.flush()
         os.fsync(temp_file.fileno())
-        os.rename(temp_file.name, path)
+        temp_file.close()
+        #os.rename(temp_file.name, path)
+        os.replace(temp_file.name, path)
+        
