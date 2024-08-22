@@ -30,7 +30,7 @@ from common.torch.ops import empty_gpu_cache
 from common.sampler import ts_dataset
 from common.torch.snapshots import SnapshotManager
 from experiments.trainer import trainer_var
-from experiments.model import generic_dec_var
+from experiments.model import generic_dec_var, generic_2stage
 from models.exog import TCN_encoder
 
 
@@ -59,11 +59,11 @@ def default_settings():
     d = tryJSON("settings.json")
 
     ## which covariates to include (will be set later if not in settings.json)
-    settings.exog_vars = d.get("exog_columns",None)
+    settings.exog_vars = d.get("exog_vars",None)
 
     ## number of training epochs; too many (relative to learning rate) overfits
     settings.iterations = d.get("iterations",400)
-    settings.init_LR = d.get("init_LR",0.00025) #0.0001 # learning rate; lower with more iterations seems to work better
+    settings.init_LR = d.get("init_LR",0.0001) # learning rate; lower with more iterations seems to work better
     ## batch size?
     ## nbeats is ok with large batch size, but it seems to hurt TCN
     ## the two parts probably learn at different rates; not sure how to handle that
@@ -80,13 +80,14 @@ def default_settings():
     settings.use_windowed_norm = bool(d.get("use_windowed_norm",True)) ## normalize inside the model by window? (tends to improve forecasts; ref. Smyl 2020)
     settings.use_static_cat = bool(d.get("use_static_cat",False)) ## whether to use static_cat; current implementation always makes forecasts worse
 
-    settings.nbeats_stacks=d.get("nbeats_stacks",8) #12 #8 # more data can support deeper model
+    ## note, stacks is currently per-stage when using 2-stage model (experiments/model.py/generic_2stage)
+    settings.nbeats_stacks=d.get("nbeats_stacks",10) # more data can support deeper model
     settings.nbeats_hidden_dim=d.get("nbeats_hidden_dim",512) #128 ## should be larger than length of lookback window
-    settings.nbeats_dropout=d.get("nbeats_dropout",0.2) ## could help prevent overfitting? default = None
+    settings.nbeats_dropout=d.get("nbeats_dropout",None) ## could help prevent overfitting?
     settings.encoder_k = d.get("encoder_k",5) #prev: 4 (5 always better)  ## TCN receptive field size = 2(k-1)(2^n - 1)+1
     settings.encoder_n = None ## auto-calculated
     settings.encoder_hidden_dim=d.get("encoder_hidden_dim",128)
-    settings.encoder_dropout=d.get("encoder_dropout",0.2) ## default is 0.2
+    settings.encoder_dropout=d.get("encoder_dropout",0.2) ## default 0.2
 
     settings.enc_temporal = d.get("enc_temporal",True) ## encode exog predictors in a way that preserves temporal structure ?
     settings.static_cat_embed_dim = d.get("static_cat_embed_dim",3) ## dimension of vector embedding if using static_categories
@@ -103,9 +104,10 @@ def read_config():
     rstate.target_file = d["target_file"] ## required
     rstate.cut = d.get("cut",None) ## train/test cut-off (integer value)
     rstate.output_prefix = d.get("output_prefix","nbxd")
-    rstate.data_dir = d.get("data_dir", os.path.join("storage","training_data"))
+    rstate.output_dir = d.get("output_dir", os.path.join("storage","output"))
     rstate.snapshot_dir = d.get("snapshot_dir", "model_snapshots")
-    ## delete models after saving forecasts?
+    rstate.data_dir = d.get("data_dir", os.path.join("storage","training_data"))
+    ## delete snapshot dir after saving forecasts?
     rstate.delete_models = bool(d.get("delete_models",False))
     ## whether target data was transformed (for making predictions on natural scale):
     rstate.input_is_log = bool(d.get("input_is_log",False))
@@ -240,7 +242,7 @@ def load_exog_data(rstate, settings, domain_specs):
         ## first column is a string/date index
         df = None if file is None else pd.read_csv(os.path.join(rstate.data_dir,file),index_col=0,dtype={0:object})
 
-        ## if no post-processing fn, assume df's index is a superset of target index
+        ## if no post-processing fn, the df's index must be a superset of target index
         ## otherwise the fn is responsible for indexing
         if fn is None:
             assert df is not None, "var_file and var_fn can't both be None"
@@ -329,7 +331,8 @@ def make_training_fn(rstate):
 
         enc_dim = input_size if settings.enc_temporal else settings.encoder_hidden_dim
         ## constructs the model; defined in experiments/model.py
-        model = generic_dec_var(enc_dim=enc_dim, output_size=settings.horizon,
+        model = generic_2stage(
+                        enc_dim=enc_dim, output_size=settings.horizon,
                         stacks = settings.nbeats_stacks,
                         layers = 4,  ## 4 per stack, from the nbeats paper
                         layer_size = settings.nbeats_hidden_dim,
@@ -471,13 +474,15 @@ def generate_quantiles(rstate, err_name = "gamma_nll"):
     return rstate
 
 
-## saves rstate to ./storage in python pickle format
+## saves rstate in python pickle format
 ## (the model itself was saved by common/torch/snapshots.py/SnapshotManager to the folder specified in rstate.snapshot_dir)
 ## (note, model settings are not automatically archived, but you can write them to rstate before saving)
 def pickle_results(rstate):
+    output_dir = rstate.output_dir
+    os.makedirs(output_dir,exist_ok=True)
     model_prefix = rstate.output_prefix
     model_suffix = str(rstate.cut) if rstate.cut is not None else str(rstate.data_index[-1])
-    path = "storage/"+model_prefix+"_"+model_suffix+".pickle"
+    path = os.path.join(output_dir , model_prefix+"_"+model_suffix+".pickle")
     with open(path,"wb") as f:
         pickle.dump(rstate, f)
 
@@ -513,6 +518,7 @@ def output_figs(rstate, horizon, series_idxs, x_width):
     train_targets = rstate.nat_targets
     test_targets = rstate.test_targets ## read only
     model_prefix = rstate.output_prefix ## read only
+    output_dir = rstate.output_dir
     forecasts = rstate.fc_med["ensemble"]
     fc_upper = rstate.fc_upper["ensemble"]
     fc_lower = rstate.fc_lower["ensemble"]
@@ -528,10 +534,10 @@ def output_figs(rstate, horizon, series_idxs, x_width):
     for i in series_idxs:
         sname = rstate.series_names[i]
         plotpred(forecasts, i, train_targets, test_targets, horizon, fc_lower, fc_upper, x0, date0)
-        plt.savefig("storage/"+model_prefix+"_"+sname+"_"+model_suffix+".png")
+        plt.savefig(os.path.join(output_dir , model_prefix+"_"+sname+"_"+model_suffix+".png"))
 
     plotpred(sum_forecasts, 0, sum_train, sum_test, horizon, sum_lower, sum_upper, x0, date0)
-    plt.savefig("storage/"+model_prefix+"_SUM_"+model_suffix+".png")
+    plt.savefig(os.path.join(output_dir , model_prefix+"_SUM_"+model_suffix+".png"))
     return None
 
 
@@ -549,7 +555,8 @@ def calc_loss(forecasts, name, test_targets, horizon):
 
 ##
 ## helper functions for processing, generating, and normalizing data
-##  currently just used on exog vars; target var requires special treatment
+##  currently just used on exog vars, in load_exog_data()
+##  (target var requires special treatment)
 ## 
 
 ## if df's index doesn't cover all of data_index,
@@ -561,6 +568,10 @@ def proc_fwd_const(df, data_index, series_names):
 def proc_const(df, data_index, series_names):
     val_dict = df.loc[series_names,:].iloc[:,0].to_dict()
     return pd.DataFrame({s:val_dict[s] for s in series_names},index=data_index)
+
+## generate a df of identical time series from a single-column df
+def proc_repeat_across(df, data_index, series_names):
+    return pd.DataFrame(index=data_index).join([df.iloc[:,0].rename(s) for s in series_names])
 
 ## generates a data frame filled with time value as a float from -2 to 2
 def proc_t(df, data_index, series_names):

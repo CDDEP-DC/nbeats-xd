@@ -1,6 +1,9 @@
 {
 "target_file": "h_3ma.csv",
-"output_prefix": "test",
+"data_dir": "storage/training_data",
+"output_dir": "storage/output",
+"snapshot_dir": "model_snapshots",
+"output_prefix": "nbxd",
 "delete_models": 0,
 "input_is_log": 0,
 "input_is_sqrt": 0,

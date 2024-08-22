@@ -79,6 +79,18 @@ def generic_dec_var(enc_dim: int, output_size: int, stacks: int, layers: int, la
                         exog_block, use_norm, force_positive)
 
 
+def generic_2stage(enc_dim: int, output_size: int, stacks: int, layers: int, layer_size: int,
+                    exog_block: t.nn.Module, use_norm: bool = False, dropout: Optional[float] = None,
+                    force_positive: bool = False):
+    """
+    Create N-BEATS 2-stage decoder model for covariates with error variance forecasting
+    """
+    return NB2stage(generic_block(enc_dim, output_size, stacks, layers, layer_size, dropout),
+                        ## use same architecture for 2nd stage and for variance
+                        generic_block(enc_dim, output_size, stacks, layers, layer_size, dropout),
+                        generic_block(enc_dim, output_size, stacks, layers, layer_size, dropout),
+                        exog_block, use_norm, force_positive)
+
 
 
 

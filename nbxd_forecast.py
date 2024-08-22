@@ -124,7 +124,7 @@ do_all_2023 = False
 random_reps = 5
 
 ## if running many tests and not enough storage:
-#settings.delete_models = True
+## set "delete_models": 1 in config.json
 
 if do_current:
     generate_current_forecast(random_reps)

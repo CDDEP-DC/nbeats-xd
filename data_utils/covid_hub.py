@@ -12,9 +12,24 @@ import numpy as np
 import pandas as pd
 
 from data_utils.forecast import tryJSON, Struct
-from data_utils.forecast import proc_t, proc_tdecay, proc_doy, proc_fwd_const, proc_const, proc_const
-from data_utils.forecast import norm_global_Z, norm_global_Z, norm_mean_scale, norm_global_max, norm_logZ_across, norm_Z_across
+from data_utils.forecast import proc_t, proc_tdecay, proc_doy, proc_fwd_const, proc_const, proc_repeat_across
+from data_utils.forecast import norm_global_Z, norm_mean_scale, norm_global_max, norm_logZ_across, norm_Z_across
 
+
+## additional functions for processing or generating exogenous predictors
+## domain_defaults() below determines when these are used
+## called in forecast.py/load_exog_data()
+## must have signature (df, data_index, series_names)
+
+## custom fn for backfilling and normalizing wastewater data
+def proc_wastewater(df, data_index, series_names):
+    ## before data is available, set each series to its median
+    ##   (is this better than setting to a nonsense value?)
+    ## then treat it like a count: sqrt transform, and scale by global median
+    x = pd.DataFrame(index=data_index).join(df)
+    x = x.apply(lambda s: s.fillna(np.nanmedian(s))).apply(np.sqrt)
+    x = x / np.nanmedian(x.values)
+    return x
 
 ## generate time since last variant of concern as a float from 0 -> 2
 ## (dates from cdc website)
@@ -51,7 +66,7 @@ def domain_defaults():
     x = Struct()
     
     ##  which exogenous predictors to use by default
-    x.exog_vars = ['doy','dewpC']
+    x.exog_vars = ["doy","dewpC"]
     
     ##  information needed to generate a model ensemble, used in specify_ensemble() below
     x.lookback_opts = [3,4,5,6]
@@ -64,24 +79,36 @@ def domain_defaults():
     x.var_names = ["tempC","dewpC","tsa_by_pop",
                 "t","t_decay","doy",
                 "vacc_rate","t_voc",
-                "pop_density_2020","med_age_2023"]
+                "pop_density_2020","med_age_2023",
+                "wastewater",
+                "variant_p1","variant_p2","variant_p3",
+                "variant_other","variant_alpha","variant_gamma","variant_delta","variant_omicron"]
     ## filename that each of the above variables is read from
     ## (directory is specified in config settings)
     ## is this is None, var_fns must specify a function for generating the variable
     x.var_files = ["tempC_7ma.csv","dewpC_7ma.csv","tsa_by_pop_daily.csv",
                 None,None,None,
                 "vacc_full_pct_to_may23.csv",None,
-                "pop_density_2020.csv","med_age_2023.csv"]
+                "pop_density_2020.csv","med_age_2023.csv",
+                "wastewater_daily.csv",
+                "variant_p1.csv","variant_p2.csv","variant_p3.csv",
+                "variant_other.csv","variant_alpha.csv","variant_gamma.csv","variant_delta.csv","variant_omicron.csv"]
     ## function for processing each of the above files (or generating if file is None)
     x.var_fns = [None,None,None,
             proc_t, proc_tdecay, proc_doy,
             proc_fwd_const, proc_tvoc,
-            proc_const, proc_const]
+            proc_const, proc_const,
+            proc_wastewater, 
+            proc_repeat_across, proc_repeat_across, proc_repeat_across,
+            proc_repeat_across,proc_repeat_across,proc_repeat_across,proc_repeat_across,proc_repeat_across]
     ## function for normalizing each variable (or None to leave as is)
     x.var_norm = [norm_global_Z, norm_global_Z, norm_mean_scale,
                 None, None, None,
                 norm_global_max, None,
-                norm_logZ_across, norm_Z_across]
+                norm_logZ_across, norm_Z_across,
+                None,
+                None,None,None,
+                None,None,None,None,None]
 
     return x
 
@@ -150,7 +177,8 @@ def output_csv(rstate, forecast_delay):
 
     # write to csv
     hub_name = "OHT_JHU-nbxd"
-    filename = "storage/"+ forecast_date.strftime("%Y-%m-%d") + "-" + hub_name + ".csv"
+    filename = os.path.join(rstate.output_dir, 
+                            forecast_date.strftime("%Y-%m-%d") + "-" + hub_name + ".csv")
     print("writing ",filename)
     df_hub.to_csv(filename, index=False)
     return None
@@ -443,6 +471,7 @@ def read_vaccine_hist():
     df_int = df_int.fillna(0.0)
     df_int.to_csv("storage/training_data/vacc_full_pct_to_may23.csv",float_format="%g")
 
+
 def read_wastewater_data():
     ##
     ## TODO: automate download from https://www.cdc.gov/nwss/rv/COVID19-nationaltrend.html
@@ -463,3 +492,40 @@ def read_wastewater_data():
     df_fips_daily = pd.DataFrame(index=idx_daily).join(df_fips_weekly).interpolate()
     df_fips_weekly.to_csv("storage/training_data/wastewater_weekly.csv")
     df_fips_daily.to_csv("storage/training_data/wastewater_daily.csv")
+
+
+def read_variant_proportions():
+    ## TODO: automate download from
+    ## https://data.cdc.gov/Laboratory-Surveillance/SARS-CoV-2-Variant-Proportions/jr58-6ysp/about_data
+    ##
+    df = pd.read_csv("storage/other/vars_p.csv")
+    vars_ord = ['other', 'alpha', 'beta', 'delta', 'gamma', 'oba', 'obq1', 'oxbb',
+                'och11', 'oeg51', 'ohk3', 'ojn', 'okp3']
+    df = df.pivot(columns="variant",index="date",values="p").fillna(0.0).loc[:,vars_ord]
+    df.index = pd.to_datetime(df.index)
+
+    ## interpolate for daily
+    daily_idx = pd.date_range(df.index[0],df.index[-1])
+    dfi = pd.DataFrame(index=daily_idx).join(df).interpolate(method="pchip")
+
+    ## lumped into 5
+    dfi[['alpha']].round(6).to_csv("storage/training_data/variant_alpha.csv")
+    dfi[['delta']].round(6).to_csv("storage/training_data/variant_delta.csv")
+    dfi[['gamma']].round(6).to_csv("storage/training_data/variant_gamma.csv")
+    pd.DataFrame(dfi[['other','beta']].sum(axis=1).rename("other")).round(6).to_csv("storage/training_data/variant_other.csv")
+    pd.DataFrame(dfi[['oba', 'obq1', 'oxbb', 'och11', 'oeg51', 'ohk3', 'ojn', 'okp3']].sum(axis=1).rename("omicron")).round(6).to_csv("storage/training_data/variant_omicron.csv")
+
+    ## n highest at each timepoint
+    ## "most recent 3" won't work; another way to do this?
+    n = 3
+    largestn = pd.DataFrame(
+        dfi.apply(lambda r: [np.round(x,4) for x in r if x > 0.0001] ,axis=1) \
+        .map(lambda v: np.pad(v,(0,max(n-len(v),0)))) \
+        .map(lambda x: np.array(x)[(np.argsort(x)[-n:])]) \
+        .rename("p"))
+
+    for i in range(n):
+        largestn["variant_p"+str(n-i)] = largestn["p"].map(lambda v: v[i])
+        largestn[["variant_p"+str(n-i)]].to_csv("storage/training_data/"+"variant_p"+str(n-i)+".csv")
+
+ 
