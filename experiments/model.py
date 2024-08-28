@@ -21,7 +21,6 @@
 """
 Shortcut functions to create N-BEATS models.
 """
-#import gin
 import numpy as np
 import torch as t
 from typing import Optional
@@ -37,59 +36,53 @@ def generic_block(input_size: int, output_size: int, stacks: int, layers: int, l
                                             layer_size=layer_size, dropout_rate=dropout)
                                 for _ in range(stacks)])
 
-#@gin.configurable()
-def generic(input_size: int, output_size: int, stacks: int, layers: int, layer_size: int, 
-            use_norm: bool = True, dropout: Optional[float] = None):
+def generic(args):
     """
     Create N-BEATS generic model. univariate, no error variance
     """
-    return NBeats_wnorm(generic_block(input_size,output_size,stacks,layers,layer_size,dropout),
-                  use_norm)
+    return NBeats_wnorm(generic_block(args.input_size, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
+                  args.use_norm)
 
 
-def generic_var(input_size: int, output_size: int, stacks: int, layers: int, layer_size: int,
-                use_norm: bool = False, dropout: Optional[float] = None):
+def generic_var(args):
     """
     Create N-BEATS generic univariate model with error variance forecasting
     """
-    return NBeats_var(generic_block(input_size, output_size, stacks, layers, layer_size, dropout),
+    return NBeats_var(generic_block(args.input_size, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
                         ## use same architecture for variance
-                        generic_block(input_size, output_size, stacks, layers, layer_size, dropout),
-                        use_norm)
+                        generic_block(args.input_size, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
+                        args.use_norm)
 
 
-def generic_decoder(enc_dim: int, output_size: int, stacks: int, layers: int, layer_size: int, 
-                    exog_block: t.nn.Module, use_norm: bool = True, dropout: Optional[float] = None):
+def generic_decoder(args):
     """
     Create N-BEATS decoder model for covariates, no error variance
     """
-    return NB_decoder(generic_block(enc_dim,output_size,stacks,layers,layer_size,dropout),
-                      exog_block, use_norm)
+    return NB_decoder(generic_block(args.enc_dim, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
+                      args.exog_block, args.use_norm)
 
 
-def generic_dec_var(enc_dim: int, output_size: int, stacks: int, layers: int, layer_size: int,
-                    exog_block: t.nn.Module, use_norm: bool = False, dropout: Optional[float] = None,
-                    force_positive: bool = False):
+def generic_dec_var(args):
     """
     Create N-BEATS decoder model for covariates with error variance forecasting
     """
-    return NB_dec_var(generic_block(enc_dim, output_size, stacks, layers, layer_size, dropout),
+    return NB_dec_var(generic_block(args.enc_dim, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
                         ## use same architecture for variance
-                        generic_block(enc_dim, output_size, stacks, layers, layer_size, dropout),
-                        exog_block, use_norm, force_positive)
+                        generic_block(args.enc_dim, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
+                        args.exog_block, args.use_norm, args.force_positive)
 
 
-def generic_2stage(enc_dim: int, output_size: int, stacks: int, layers: int, layer_size: int,
-                    exog_block: t.nn.Module, use_norm: bool = False, dropout: Optional[float] = None,
-                    force_positive: bool = False):
+def generic_2stage(args):
     """
     Create N-BEATS 2-stage decoder model for covariates with error variance forecasting
     """
-    return NB2stage(generic_block(enc_dim, output_size, stacks, layers, layer_size, dropout),
-                        ## use same architecture for 2nd stage and for variance
-                        generic_block(enc_dim, output_size, stacks, layers, layer_size, dropout),
-                        generic_block(enc_dim, output_size, stacks, layers, layer_size, dropout),
-                        exog_block, use_norm, force_positive)
+    return NB2stage(generic_block(args.input_size, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
+                        ## use same architecture for 2nd stage and variance
+                        ## TODO: allow configuring a different # stacks for each stage
+                        ## note, 2nd stage input is exog_block's output (1st stage input was target var)
+                        generic_block(args.enc_dim, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
+                        generic_block(args.enc_dim, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
+                        args.exog_block, args.use_norm, args.force_positive)
 
 
 

@@ -44,10 +44,12 @@ from torch.distributions.gamma import Gamma
 def trainer(snapshot_manager: SnapshotManager,
             model: t.nn.Module,
             training_set: Iterator,
-            timeseries_frequency: int,
             loss_name: str,
             iterations: int,
-            learning_rate: float = 0.001):
+            learning_rate: float = 0.001,
+            **kwargs):
+
+    timeseries_frequency = kwargs.get("timeseries_frequency", 0)
 
     model = model.to(default_device())
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -159,10 +161,10 @@ def __ll_fn(loss_name: str):
 def trainer_var(snapshot_manager: SnapshotManager,
             model: t.nn.Module,
             training_set: Iterator,
-            timeseries_frequency: int,
             loss_name: str,
             iterations: int,
-            learning_rate: float = 0.001):
+            learning_rate: float = 0.001,
+            **kwargs):
 
     model = model.to(default_device())
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -206,5 +208,75 @@ def trainer_var(snapshot_manager: SnapshotManager,
                                   optimizer=optimizer)
     return model
 
+
+
+
+
+##
+## like trainer_var, but writes validation loss to snapshot
+##
+
+def trainer_validation(snapshot_manager: SnapshotManager,
+            model: t.nn.Module,
+            training_set: Iterator,
+            loss_name: str,
+            iterations: int,
+            learning_rate: float = 0.001,
+            **kwargs):
+
+    validation_input = kwargs.get("validation_input",None)
+    validation_data = kwargs.get("validation_data",None)
+
+    if validation_data is not None:
+        validation_data = to_tensor(validation_data)
+    
+    model = model.to(default_device())
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    training_loss_fn = __ll_fn(loss_name)
+
+    lr_decay_step = iterations // 3
+    if lr_decay_step == 0:
+        lr_decay_step = 1
+
+    iteration = snapshot_manager.restore(model, optimizer)
+
+    #
+    # Training Loop
+    #
+    snapshot_manager.enable_time_tracking()
+    for i in range(iteration + 1, iterations + 1):
+        model.train()
+        x, x_mask, static_c, y, y_mask = next(training_set)
+        optimizer.zero_grad()
+
+        forecast_mu, forecast_var = model(x, x_mask, static_c, y*y_mask)
+        
+        ## TODO: implement mask for loss fn (currently not masking)
+        training_loss = training_loss_fn(forecast_mu, y, forecast_var)
+
+        if np.isnan(float(training_loss)):
+            print("argh")
+            break
+
+        training_loss.backward()
+        t.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = learning_rate * 0.5 ** (i // lr_decay_step)
+
+        if validation_input is not None:
+            x, x_mask, static_c = validation_input
+            model.eval()
+            with t.no_grad():
+                forecast_mu, forecast_var = model(x, x_mask, static_c)
+                validation_loss = training_loss_fn(forecast_mu, validation_data, forecast_var)
+
+        snapshot_manager.register(iteration=i,
+                                  training_loss=float(training_loss),
+                                  validation_loss=validation_loss, model=model,
+                                  optimizer=optimizer)
+    return model
 
 

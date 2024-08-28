@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 from common.torch.ops import empty_gpu_cache
 from common.sampler import ts_dataset
 from common.torch.snapshots import SnapshotManager
-from experiments.trainer import trainer_var
+from experiments.trainer import trainer_var, trainer_validation
 from experiments.model import generic_dec_var, generic_2stage
 from models.exog import TCN_encoder
 
@@ -63,7 +63,7 @@ def default_settings():
 
     ## number of training epochs; too many (relative to learning rate) overfits
     settings.iterations = d.get("iterations",400)
-    settings.init_LR = d.get("init_LR",0.0001) # learning rate; lower with more iterations seems to work better
+    settings.init_LR = d.get("init_LR",0.00025) # learning rate; lower with more iterations seems to work better
     ## batch size?
     ## nbeats is ok with large batch size, but it seems to hurt TCN
     ## the two parts probably learn at different rates; not sure how to handle that
@@ -81,9 +81,10 @@ def default_settings():
     settings.use_static_cat = bool(d.get("use_static_cat",False)) ## whether to use static_cat; current implementation always makes forecasts worse
 
     ## note, stacks is currently per-stage when using 2-stage model (experiments/model.py/generic_2stage)
-    settings.nbeats_stacks=d.get("nbeats_stacks",10) # more data can support deeper model
+    ## TODO: allow configuring a different # stacks for each stage
+    settings.nbeats_stacks=d.get("nbeats_stacks",8) # more data can support deeper model
     settings.nbeats_hidden_dim=d.get("nbeats_hidden_dim",512) #128 ## should be larger than length of lookback window
-    settings.nbeats_dropout=d.get("nbeats_dropout",None) ## could help prevent overfitting?
+    settings.nbeats_dropout=d.get("nbeats_dropout",0.2) ## could help prevent overfitting?
     settings.encoder_k = d.get("encoder_k",5) #prev: 4 (5 always better)  ## TCN receptive field size = 2(k-1)(2^n - 1)+1
     settings.encoder_n = None ## auto-calculated
     settings.encoder_hidden_dim=d.get("encoder_hidden_dim",128)
@@ -123,6 +124,9 @@ def read_config():
     rstate.variance_scale = d.get("variance_scale", 1.0)
     ## default quantiles
     rstate.qtiles = [0.01, 0.025, *np.linspace(0.05, 0.95, 19).round(2), 0.975, 0.99]
+    ## if calc_validation is true, the lookback window preceding rstate.cut will be used to forecast
+    ##  the horizon immediately after the cut during training, and losses written to model snapshot
+    rstate.calc_validation = bool(d.get("calc_validation", False))
 
     return rstate
 
@@ -163,20 +167,19 @@ def init_target_data(rstate, settings):
         reverse_transform = (lambda x: np.exp(x) - 1.0)
         var_dfs["_LOG"] = df_train
         var_dfs["_NAT_SCALE"] = df_train.apply(reverse_transform)
-        test_targets = reverse_transform(test_targets) if test_targets is not None else None
         target_var = "_LOG"
     elif target_is_sqrt:
         transform = None
         reverse_transform = (lambda x: np.square(x))
         var_dfs["_SQRT"] = df_train
         var_dfs["_NAT_SCALE"] = df_train.apply(reverse_transform)
-        test_targets = reverse_transform(test_targets) if test_targets is not None else None
         target_var = "_SQRT"
     elif log_transform:
         transform = (lambda x: np.log(x + 1.0))
         reverse_transform = (lambda x: np.exp(x) - 1.0)
         var_dfs["_NAT_SCALE"] = df_train
         var_dfs["_LOG"] = df_train.apply(transform)
+        test_targets = transform(test_targets) if test_targets is not None else None
         target_var = "_LOG"
         target_is_log = True ## needed for special treament (variance forecasts)
     elif sqrt_transform:
@@ -184,6 +187,7 @@ def init_target_data(rstate, settings):
         reverse_transform = (lambda x: np.square(x))
         var_dfs["_NAT_SCALE"] = df_train
         var_dfs["_SQRT"] = df_train.apply(transform)
+        test_targets = transform(test_targets) if test_targets is not None else None
         target_var = "_SQRT"
         target_is_sqrt = True ## needed for special treament (variance forecasts)
     else:
@@ -301,6 +305,13 @@ def generate_forecast(m, data_iterator):
 ## or called in a loop with different settings to generate an ensemble
 def make_training_fn(rstate):
 
+    ## function to construct the model; defined in experiments/model.py
+    ## TODO: make this a configurable option
+    model_fn = generic_2stage ##generic_dec_var
+
+    ## function to create the training loop (incl. loss fn); defined in experiments/trainer.py
+    train_fn = trainer_validation if rstate.calc_validation else trainer_var
+
     ## result fn returns forecast; model is saved in snapshots folder
     def ret_fn(model_name, settings):
         ## switch target columns if using normalized target
@@ -309,13 +320,12 @@ def make_training_fn(rstate):
         else:
             target_key = rstate.target_var
 
-        input_size = settings.lookback * settings.horizon  ## backward window size, in time units
-        use_vars = [target_key, *(settings.exog_vars)]
-
         ## training data dims are [series, time, variables]
         ## where the first variable is the target, and the rest are covariates
+        use_vars = [target_key, *(settings.exog_vars)]
         training_values = np.stack([rstate.series_dfs[s].loc[:,use_vars] for s in rstate.series_names])
         
+        input_size = settings.lookback * settings.horizon  ## backward window size, in time units
         n_features = training_values.shape[2] - 1 ## number of exogenous covariates
         n_embed = rstate.static_cat.shape[0] if settings.use_static_cat else 0
         embed_dim = settings.static_cat_embed_dim if settings.use_static_cat else 0
@@ -329,17 +339,20 @@ def make_training_fn(rstate):
                                  settings.encoder_k, settings.encoder_dropout, 
                                  settings.enc_temporal, n_embed, embed_dim)
 
-        enc_dim = input_size if settings.enc_temporal else settings.encoder_hidden_dim
-        ## constructs the model; defined in experiments/model.py
-        model = generic_2stage(
-                        enc_dim=enc_dim, output_size=settings.horizon,
-                        stacks = settings.nbeats_stacks,
-                        layers = 4,  ## 4 per stack, from the nbeats paper
-                        layer_size = settings.nbeats_hidden_dim,
-                        exog_block = exog_block,
-                        use_norm= settings.use_windowed_norm,
-                        dropout= settings.nbeats_dropout,
-                        force_positive= settings.force_positive_forecast)
+        ## args used by model constructor fn
+        model_args = Struct()
+        model_args.input_size = input_size
+        model_args.enc_dim = input_size if settings.enc_temporal else settings.encoder_hidden_dim
+        model_args.output_size = settings.horizon
+        model_args.stacks = settings.nbeats_stacks
+        model_args.layers = 4  ## 4 per stack, from the nbeats paper
+        model_args.layer_size = settings.nbeats_hidden_dim
+        model_args.exog_block = exog_block
+        model_args.use_norm= settings.use_windowed_norm
+        model_args.dropout= settings.nbeats_dropout
+        model_args.force_positive= settings.force_positive_forecast
+        ## call selected model constructor fn
+        model = model_fn(model_args)
         
         ## dataset iterator; defined in common/sampler.py
         train_ds = ts_dataset(timeseries=training_values, static_cat=rstate.static_cat,
@@ -352,14 +365,15 @@ def make_training_fn(rstate):
         snapshot_manager = SnapshotManager(snapshot_dir=os.path.join(rstate.snapshot_dir, model_name),
                                             total_iterations=settings.iterations)
 
-        ## training loop, including loss fn; defined in experiments/trainer.py
-        model = trainer_var(snapshot_manager=snapshot_manager,
+        ## train the model using selected fn
+        model = train_fn(snapshot_manager=snapshot_manager,
                         model=model,
                         training_set=iter(training_set),
-                        timeseries_frequency=0,  ## not used
                         loss_name=settings.lfn_name,
                         iterations=settings.iterations,
-                        learning_rate=settings.init_LR)
+                        learning_rate=settings.init_LR,
+                        validation_input = train_ds.last_insample_window() if rstate.test_targets is not None else None,
+                        validation_data = rstate.test_targets[:,0:settings.horizon] if rstate.test_targets is not None else None)
         
         # training done; generate forecasts
         f_mu, f_var = generate_forecast(model, train_ds)
@@ -517,6 +531,8 @@ def plotpred(forecasts, ser, training_targets, test_targets, horizon, lower_fc=N
 def output_figs(rstate, horizon, series_idxs, x_width):
     train_targets = rstate.nat_targets
     test_targets = rstate.test_targets ## read only
+    if rstate.reverse_transform is not None:
+        test_targets = rstate.reverse_transform(test_targets)
     model_prefix = rstate.output_prefix ## read only
     output_dir = rstate.output_dir
     forecasts = rstate.fc_med["ensemble"]

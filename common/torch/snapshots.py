@@ -42,7 +42,7 @@ class SnapshotManager:
         self.losses_file = os.path.join(snapshot_dir, 'losses')
         self.iteration_file = os.path.join(snapshot_dir, 'iteration')
         self.time_tracking_file = os.path.join(snapshot_dir, 'time')
-        self.logging_frequency = max(1, min(logging_frequency, total_iterations // 10))
+        self.logging_frequency = max(1, min(logging_frequency, total_iterations // 20))
         self.snapshot_frequency = max(1, min(snapshot_frequency, total_iterations))
         self.start_time = None
         self.losses = {'training': {}, 'validation': {}}
@@ -84,6 +84,18 @@ class SnapshotManager:
         """
         if os.path.isfile(self.losses_file):
             losses = t.load(self.losses_file)['training']
+            return pd.DataFrame(losses, index=[0])[sorted(losses.keys())].T
+        else:
+            return pd.DataFrame([np.nan])
+
+    def load_validation_losses(self) -> pd.DataFrame:
+        """
+        Load validation losses into a dataframe.
+
+        :return: validation losses in pandas DatFrame.
+        """
+        if os.path.isfile(self.losses_file):
+            losses = t.load(self.losses_file)['validation']
             return pd.DataFrame(losses, index=[0])[sorted(losses.keys())].T
         else:
             return pd.DataFrame([np.nan])

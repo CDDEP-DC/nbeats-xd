@@ -34,18 +34,18 @@ from data_utils.forecast import pickle_results, read_pickle, output_figs
 from data_utils.covid_hub import domain_defaults, specify_ensemble, output_csv, download_training_data
 
 
-def init_rstate(cut, random_reps, print_settings=False):
+
+
+
+def init_rstate(cut, settings, domain_specs, ensemble_fn=specify_ensemble):
     rstate = read_config()
     rstate.cut = cut
-    if print_settings:
-        print(rstate)
-    settings = default_settings()
-    domain_specs = domain_defaults()
-    domain_specs.random_reps = random_reps
+    
     rstate, settings = init_target_data(rstate, settings)
     rstate, settings = load_exog_data(rstate, settings, domain_specs)
-    rstate.settings_list = specify_ensemble(settings, domain_specs)
-    return rstate
+    rstate.settings_list = ensemble_fn(settings, domain_specs)
+    
+    return rstate, settings
 
 
 def generate_ensemble(rstate, print_settings=False):
@@ -81,23 +81,73 @@ def delete_model_dir(rstate):
             pass
 
 
+
+## when ensembing different lookback window sizes:
+## larger lookback window = more input nodes
+## try adjusting the size of the hidden layers accordingly
+def custom_ensemble(template, specs):
+    settings_list = []
+    for j in range(specs.random_reps):
+        for opt in specs.lookback_opts:
+            x = deepcopy(template)
+            x.lookback = opt
+            x.nbeats_hidden_dim = opt * 80
+            #x.encoder_hidden_dim = opt * 20
+            settings_list.append(x)
+    return settings_list
+
+
+## try adjusting the amount of training based on the amount of training data history
+## (lowering learning rate seems to work better than decreasing # of iterations)
+def adapt_iter(x):
+    return int(np.round(200 + (x - 901) * 2.0 / 3.0))
+
+def adapt_lr(x):
+    return np.round(0.0001 + (x - 901) * 4e-7, 7) 
+
+def run_test(cut, random_reps=None, ensemble_fn=specify_ensemble, adj_iter=False, adj_LR=True):
+    ## if adj_*, train more when there is more data; otherwise use values from settings.json
+    settings = default_settings()
+    if adj_iter: settings.iterations = adapt_iter(cut)
+    if adj_LR: settings.init_LR = adapt_lr(cut)
+
+    domain_specs = domain_defaults()
+    if random_reps is not None: domain_specs.random_reps = random_reps
+    
+    rstate, settings = init_rstate(cut, settings, domain_specs, ensemble_fn)
+    print("settings template:")
+    print(settings)
+    rstate = generate_ensemble(rstate, print_settings=True)
+
+    pickle_results(rstate)
+    output_figs(rstate, rstate.settings_list[0].horizon, [20, 4], 400)
+
+    ## for covid hub; forecasts start this many days after last day of data:
+    forecast_delay = 10 if cut > 1067 else 2
+    output_csv(rstate, forecast_delay)
+    
+    delete_model_dir(rstate)
+
+
 def generate_current_forecast(random_reps):
     download_training_data() ## get the latest training data
-    forecast_delay = 10 ## days from end of most recent data to expected "day 0" of forecast
-    rstate = init_rstate(None, random_reps, print_settings=True) ## use all avail data
+    settings = default_settings()
+
+    domain_specs = domain_defaults()
+    if random_reps is not None: domain_specs.random_reps = random_reps
+
+    ## use all avail data
+    rstate, settings = init_rstate(None, settings, domain_specs, custom_ensemble) 
+    print("settings template:")
+    print(settings)
     rstate = generate_ensemble(rstate, print_settings=True)
+
     pickle_results(rstate)
     output_figs(rstate, rstate.settings_list[0].horizon, [20, 4], 400)
-    output_csv(rstate, forecast_delay)
 
-
-def run_test(cut, forecast_delay, random_reps):
-    rstate = init_rstate(cut, random_reps, print_settings=True)
-    rstate = generate_ensemble(rstate, print_settings=True)
-    pickle_results(rstate)
-    output_figs(rstate, rstate.settings_list[0].horizon, [20, 4], 400)
+    ## days from end of most recent data to expected "day 0" of forecast
+    forecast_delay = 10 
     output_csv(rstate, forecast_delay)
-    delete_model_dir(rstate)
 
 
 def test_all_2023(random_reps):
@@ -106,9 +156,8 @@ def test_all_2023(random_reps):
     test_cut_vals1 = list(range(901,1068,7))
     test_cut_vals2 = list(range(1068,1258,7))
     test_cut_vals = test_cut_vals1 + test_cut_vals2
-    forecast_delay_days = [10 if x > 1067 else 2 for x in test_cut_vals]
-    for (cut,forecast_delay) in zip(test_cut_vals, forecast_delay_days):
-        run_test(cut, forecast_delay, random_reps)
+    for cut in test_cut_vals:
+        run_test(cut, random_reps, custom_ensemble)
 
 
 

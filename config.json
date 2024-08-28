@@ -9,5 +9,6 @@
 "input_is_sqrt": 0,
 "log_transform": 0,
 "sqrt_transform": 1,
-"variance_scale": 1.0
+"variance_scale": 1.0,
+"calc_validation": 1
 }
