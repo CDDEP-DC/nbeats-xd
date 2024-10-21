@@ -1,0 +1,10 @@
+{
+"iterations": 400,
+"init_LR": 0.00025,
+"batch_size": 128,
+"lookback": 4,
+"horizon": 40,
+"nbeats_stacks": 8,
+"encoder_dropout": 0.2,
+"nbeats_dropout": 0.2
+}

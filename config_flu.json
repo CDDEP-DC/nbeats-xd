@@ -1,0 +1,15 @@
+{
+"target_file": "flunet_samples_per100k.csv",
+"weight_file": "flunet_weights.csv",
+"data_dir": "fluview",
+"output_dir": "fluview/output",
+"snapshot_dir": "fluview/snapshots",
+"output_prefix": "flu",
+"delete_models": 0,
+"input_is_log": 0,
+"input_is_sqrt": 0,
+"log_transform": 0,
+"sqrt_transform": 1,
+"variance_scale": 1.0,
+"calc_validation": 1
+}

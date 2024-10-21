@@ -41,7 +41,7 @@ def generic(args):
     Create N-BEATS generic model. univariate, no error variance
     """
     return NBeats_wnorm(generic_block(args.input_size, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
-                  args.use_norm)
+                  args.use_norm, args.norm_mean)
 
 
 def generic_var(args):
@@ -51,7 +51,7 @@ def generic_var(args):
     return NBeats_var(generic_block(args.input_size, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
                         ## use same architecture for variance
                         generic_block(args.input_size, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
-                        args.use_norm)
+                        args.use_norm, args.force_positive, args.norm_mean)
 
 
 def generic_decoder(args):
@@ -59,7 +59,7 @@ def generic_decoder(args):
     Create N-BEATS decoder model for covariates, no error variance
     """
     return NB_decoder(generic_block(args.enc_dim, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
-                      args.exog_block, args.use_norm)
+                      args.exog_block, args.use_norm, args.norm_mean)
 
 
 def generic_dec_var(args):
@@ -69,7 +69,7 @@ def generic_dec_var(args):
     return NB_dec_var(generic_block(args.enc_dim, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
                         ## use same architecture for variance
                         generic_block(args.enc_dim, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
-                        args.exog_block, args.use_norm, args.force_positive)
+                        args.exog_block, args.use_norm, args.force_positive, args.norm_mean)
 
 
 def generic_2stage(args):
@@ -82,7 +82,7 @@ def generic_2stage(args):
                         ## note, 2nd stage input is exog_block's output (1st stage input was target var)
                         generic_block(args.enc_dim, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
                         generic_block(args.enc_dim, args.output_size, args.stacks, args.layers, args.layer_size, args.dropout),
-                        args.exog_block, args.use_norm, args.force_positive)
+                        args.exog_block, args.use_norm, args.force_positive, args.norm_mean)
 
 
 

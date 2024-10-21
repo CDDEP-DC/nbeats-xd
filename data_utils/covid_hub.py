@@ -25,10 +25,9 @@ from data_utils.forecast import norm_global_Z, norm_mean_scale, norm_global_max,
 def proc_wastewater(df, data_index, series_names):
     ## before data is available, set each series to its median
     ##   (is this better than setting to a nonsense value?)
-    ## then treat it like a count: sqrt transform, and scale by global median
     x = pd.DataFrame(index=data_index).join(df)
-    x = x.apply(lambda s: s.fillna(np.nanmedian(s))).apply(np.sqrt)
-    x = x / np.nanmedian(x.values)
+    x = x.apply(lambda s: s.fillna(np.nanmedian(s)))
+    ## wastewater percentile data is already normalized
     return x
 
 ## generate time since last variant of concern as a float from 0 -> 2
@@ -66,7 +65,7 @@ def domain_defaults():
     x = Struct()
     
     ##  which exogenous predictors to use by default
-    x.exog_vars = ["doy","dewpC"]
+    x.exog_vars = ["doy","dewpC","wastewater"]
     
     ##  information needed to generate a model ensemble, used in specify_ensemble() below
     x.lookback_opts = [3,4,5,6]

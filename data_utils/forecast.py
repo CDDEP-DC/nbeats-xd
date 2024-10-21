@@ -54,9 +54,9 @@ def tryJSON(filename):
 
 ## default model settings; entries in settings.json take precedence
 ## this data structure is meant to hold settings that can change between models within an ensemble
-def default_settings():
+def default_settings(filename="settings.json"):
     settings = Struct()
-    d = tryJSON("settings.json")
+    d = tryJSON(filename)
 
     ## which covariates to include (will be set later if not in settings.json)
     settings.exog_vars = d.get("exog_vars",None)
@@ -78,6 +78,7 @@ def default_settings():
     settings.force_positive_forecast = bool(d.get("force_positive_forecast",False)) ## if loss fn requires > 0
     settings.normalize_target = bool(d.get("normalize_target",False)) ## normalize the target var before passing to model? (see notes below)
     settings.use_windowed_norm = bool(d.get("use_windowed_norm",True)) ## normalize inside the model by window? (tends to improve forecasts; ref. Smyl 2020)
+    settings.windowed_norm_mean = bool(d.get("windowed_norm_mean",False)) ## use mean instead of median for windowed normalization
     settings.use_static_cat = bool(d.get("use_static_cat",False)) ## whether to use static_cat; current implementation always makes forecasts worse
 
     ## note, stacks is currently per-stage when using 2-stage model (experiments/model.py/generic_2stage)
@@ -92,17 +93,18 @@ def default_settings():
 
     settings.enc_temporal = d.get("enc_temporal",True) ## encode exog predictors in a way that preserves temporal structure ?
     settings.static_cat_embed_dim = d.get("static_cat_embed_dim",3) ## dimension of vector embedding if using static_categories
-    settings.history_size_in_horizons = d.get("history_size_in_horizons",60) ## maximum length of history to consider for training, in # of horizons
+    settings.history_size_in_horizons = d.get("history_size_in_horizons",1000) ## maximum length of history to consider for training, in # of horizons
 
     return settings
 
 
 ## default config settings; entries in config.json take precedence
 ## this struct is meant to hold settings that don't change between models within an ensemble
-def read_config():
+def read_config(filename="config.json"):
     rstate = Struct()
-    d = tryJSON("config.json")
+    d = tryJSON(filename)
     rstate.target_file = d["target_file"] ## required
+    rstate.weight_file = d.get("weight_file",None) ## optional
     rstate.cut = d.get("cut",None) ## train/test cut-off (integer value)
     rstate.output_prefix = d.get("output_prefix","nbxd")
     rstate.output_dir = d.get("output_dir", os.path.join("storage","output"))
@@ -127,6 +129,8 @@ def read_config():
     ## if calc_validation is true, the lookback window preceding rstate.cut will be used to forecast
     ##  the horizon immediately after the cut during training, and losses written to model snapshot
     rstate.calc_validation = bool(d.get("calc_validation", False))
+    ## prob dist for generating quantiles
+    rstate.quantile_err_fn = "gamma"
 
     return rstate
 
@@ -213,6 +217,14 @@ def init_target_data(rstate, settings):
     ## for input to training fn
     series_dfs = {s:pd.DataFrame(index=data_index).join([var_dfs[k].loc[:,s].rename(k) for k in var_dfs]) for s in series_names}
 
+    ## if target series are per-capita, need weights for forecasting the sum
+    ## (if they are counts, can just sum them; leave series_weights as None)
+    if (rstate.weight_file is not None) and (rstate.weight_file != ""):
+        df = pd.read_csv(os.path.join(rstate.data_dir,rstate.weight_file),index_col=0)
+        series_weights = np.array([df.loc[s,"weight"] for s in series_names])[:,None] ## dims [series, 1]
+    else:
+        series_weights = None
+
     ## write global state
     rstate.series_dfs = series_dfs
     rstate.target_var = target_var
@@ -224,6 +236,7 @@ def init_target_data(rstate, settings):
     rstate.target_is_sqrt = target_is_sqrt
     rstate.reverse_transform = reverse_transform
     rstate.optional_inv_scale = optional_inv_scale
+    rstate.series_weights = series_weights
 
     return rstate, settings
 
@@ -307,7 +320,7 @@ def make_training_fn(rstate):
 
     ## function to construct the model; defined in experiments/model.py
     ## TODO: make this a configurable option
-    model_fn = generic_2stage ##generic_dec_var
+    model_fn = generic_2stage ##generic_dec_var #
 
     ## function to create the training loop (incl. loss fn); defined in experiments/trainer.py
     train_fn = trainer_validation if rstate.calc_validation else trainer_var
@@ -348,9 +361,10 @@ def make_training_fn(rstate):
         model_args.layers = 4  ## 4 per stack, from the nbeats paper
         model_args.layer_size = settings.nbeats_hidden_dim
         model_args.exog_block = exog_block
-        model_args.use_norm= settings.use_windowed_norm
-        model_args.dropout= settings.nbeats_dropout
-        model_args.force_positive= settings.force_positive_forecast
+        model_args.use_norm = settings.use_windowed_norm
+        model_args.dropout = settings.nbeats_dropout
+        model_args.force_positive = settings.force_positive_forecast
+        model_args.norm_mean = settings.windowed_norm_mean
         ## call selected model constructor fn
         model = model_fn(model_args)
         
@@ -391,14 +405,14 @@ def make_training_fn(rstate):
 
 ## used by generate_quantiles() below
 def inverse_cdf(mu, s2, qtiles, lfn_name):
-    if lfn_name == "t_nll": ## df hardcoded in experiments/trainer.py
+    if lfn_name == "t": ## df hardcoded in experiments/trainer.py
         return [stats.t.ppf(q=x,loc=mu,scale=np.sqrt(s2),df=5) for x in qtiles]
-    elif lfn_name == "norm_nll":
+    elif lfn_name == "norm":
         return [stats.norm.ppf(q=x,loc=mu,scale=np.sqrt(s2)) for x in qtiles]
-    elif lfn_name == "gamma_nll":
-        ## gamma for counts breaks down near 0
-        m = np.maximum(mu, 0.5)
-        v = np.maximum(s2, 0.1)
+    elif lfn_name == "gamma":
+        ## mean and var can't be 0
+        m = np.maximum(mu, 1e-6)
+        v = np.maximum(s2, 1e-6)
         return [stats.gamma.ppf(q=x, a=(m*m/v) , scale=(v/m)) for x in qtiles]
 
 
@@ -415,11 +429,9 @@ def inverse_cdf(mu, s2, qtiles, lfn_name):
 ## note this also generates mean/median/quantiles for the sum of the target series
 ##  (e.g., if target series are states and we want national forecast)
 ##
-def generate_quantiles(rstate, err_name = "gamma_nll"):
+def generate_quantiles(rstate):
 
-    ## estimated correlations, to calculate var(sum)
-    ##  (because var(sum) = sum(var) only for independent variables)
-    corr_mat = np.corrcoef(rstate.nat_targets)  
+    err_name = rstate.quantile_err_fn if rstate.quantile_err_fn is not None else "gamma"
 
     fc_quantiles = {} ## quantiles for individual series forecasts
     fc_mean = {}
@@ -432,6 +444,12 @@ def generate_quantiles(rstate, err_name = "gamma_nll"):
     sum_upper = {}
     sum_lower = {}
 
+    ## estimated correlations, to calculate var(sum)
+    ##  (because var(sum) = sum(var) only for independent variables)
+    ## note, no need to weight the target vars here; weights will be factored into covariance matrix below
+    corr_mat = np.corrcoef(rstate.nat_targets)
+    W = rstate.series_weights if rstate.series_weights is not None else 1.0
+
     for k in rstate.mu_fc:
         ## mean and variance forecasts; these have been de-scaled but not un-transformed
         mu = rstate.mu_fc[k] 
@@ -442,8 +460,11 @@ def generate_quantiles(rstate, err_name = "gamma_nll"):
         ##   (that won't work for the sum though, see below)
         mu_nat = mu if rstate.reverse_transform is None else rstate.reverse_transform(mu)
 
-        sum_mu = np.nansum(mu_nat, axis=0, keepdims=True)  ## sum(natural scale mu)
-        st_devs = np.sqrt(s2) ## needed for var(sum) below
+        ## do weighted sum here
+        sum_mu = np.nansum(mu_nat * W, axis=0, keepdims=True)  ## sum(natural scale mu)
+        ## st_devs is used only for var(sum) below
+        ## scaling st_devs by weights will correctly scale the var-covar terms by weight^2 in the calculations below
+        st_devs = np.sqrt(s2) * W
 
         if rstate.target_is_log:
             ## approximate variance on natural scale: var(x) ~~ mu_x * var(log(x)) * mu_x
@@ -509,12 +530,17 @@ def read_pickle(path):
 
 ## some crude plotting functions
 ## note, "ser" is the series integer index, not the series name
-def plotpred(forecasts, ser, training_targets, test_targets, horizon, lower_fc=None, upper_fc=None, x_start = 0, date0 = None, x_freq="D"):
+def plotpred(forecasts, ser, training_targets, test_targets, horizon, lower_fc=None, upper_fc=None, x_start = 0, 
+             date_idx=None, colors=["black","orangered"], figsize=(7,5)):
+    
     x_end = training_targets.shape[1]
-    x_idx = pd.date_range(pd.to_datetime(date0),periods=x_end+horizon,freq=x_freq) if date0 is not None else np.arange(x_end+horizon)
-    colors = ["black","orangered"]
-    #colors = ["white","yellow"]
-    _, ax = plt.subplots(figsize=(7,5))
+    if date_idx is not None:
+        x_idx = pd.to_datetime(date_idx)
+        x_idx = x_idx.append(pd.date_range(x_idx[-1],periods=horizon+1,freq=pd.infer_freq(x_idx))[1:])
+    else:
+        x_idx = np.arange(x_end+horizon)
+
+    _, ax = plt.subplots(figsize=figsize)
     ax.grid(alpha=0.2)
     pd.Series(training_targets[ser,x_start:x_end],index=x_idx[x_start:x_end]).plot(ax=ax,grid=True,color=colors[0],linewidth=0.5)
     if test_targets is not None:
@@ -528,32 +554,43 @@ def plotpred(forecasts, ser, training_targets, test_targets, horizon, lower_fc=N
 ## calls plotpred on series_idxs and on the sum-of-series forecasts
 ## expects rstate to contain the quantiles provided in generate_quantiles()
 ## expects the forecast dict to have an entry keyed "ensemble"
-def output_figs(rstate, horizon, series_idxs, x_width):
+def output_figs(rstate, horizon, series_idxs, x_width, colors=["black","orangered"], figsize=(7,5), plot_mean=False, k=None):
     train_targets = rstate.nat_targets
     test_targets = rstate.test_targets ## read only
     if rstate.reverse_transform is not None:
         test_targets = rstate.reverse_transform(test_targets)
-    model_prefix = rstate.output_prefix ## read only
+
     output_dir = rstate.output_dir
-    forecasts = rstate.fc_med["ensemble"]
-    fc_upper = rstate.fc_upper["ensemble"]
-    fc_lower = rstate.fc_lower["ensemble"]
-    sum_forecasts = rstate.sum_med["ensemble"]
-    sum_upper = rstate.sum_upper["ensemble"]
-    sum_lower = rstate.sum_lower["ensemble"]
-    sum_train = train_targets.sum(axis=0,keepdims=True)
-    sum_test = test_targets.sum(axis=0,keepdims=True) if test_targets is not None else None
+    if k is None:
+        k = "ensemble"
+        file_prefix = str(rstate.cut) if rstate.cut is not None else str(rstate.data_index[-1])
+        file_prefix = rstate.output_prefix + "_" + file_prefix
+    else:
+        file_prefix = k
+
+    if plot_mean:
+        forecasts = rstate.fc_mean[k]
+        sum_forecasts = rstate.sum_mean[k]
+    else:
+        forecasts = rstate.fc_med[k]
+        sum_forecasts = rstate.sum_med[k]
+    fc_upper = rstate.fc_upper[k]
+    fc_lower = rstate.fc_lower[k]
+    sum_upper = rstate.sum_upper[k]
+    sum_lower = rstate.sum_lower[k]
+
+    W = rstate.series_weights if rstate.series_weights is not None else 1.0 
+    sum_train = (train_targets*W).sum(axis=0,keepdims=True)
+    sum_test = (test_targets*W).sum(axis=0,keepdims=True) if test_targets is not None else None
     x0 = rstate.cut - x_width if rstate.cut is not None else train_targets.shape[1] - x_width
-    model_suffix = str(rstate.cut) if rstate.cut is not None else str(rstate.data_index[-1])
-    date0 = rstate.data_index[0]
 
     for i in series_idxs:
         sname = rstate.series_names[i]
-        plotpred(forecasts, i, train_targets, test_targets, horizon, fc_lower, fc_upper, x0, date0)
-        plt.savefig(os.path.join(output_dir , model_prefix+"_"+sname+"_"+model_suffix+".png"))
+        plotpred(forecasts, i, train_targets, test_targets, horizon, fc_lower, fc_upper, x0, rstate.data_index, colors, figsize)
+        plt.savefig(os.path.join(output_dir , file_prefix+"_"+sname+".png"))
 
-    plotpred(sum_forecasts, 0, sum_train, sum_test, horizon, sum_lower, sum_upper, x0, date0)
-    plt.savefig(os.path.join(output_dir , model_prefix+"_SUM_"+model_suffix+".png"))
+    plotpred(sum_forecasts, 0, sum_train, sum_test, horizon, sum_lower, sum_upper, x0, rstate.data_index, colors, figsize)
+    plt.savefig(os.path.join(output_dir , file_prefix+"_SUM.png"))
     return None
 
 
@@ -602,8 +639,15 @@ def proc_tdecay(df, data_index, series_names):
 ## day of year as a float from -2 to 2
 ## assumes date index
 def proc_doy(df, data_index, series_names):
-    return pd.DataFrame({s:np.array(-2.0 + 4.0 * pd.to_datetime(data_index).dayofyear.values / 366.0, dtype=np.float32) 
-                         for s in series_names}, index=data_index)
+    v = np.array(-2.0 + 4.0 * pd.to_datetime(data_index).dayofyear.values / 366.0, dtype=np.float32) 
+    return pd.DataFrame({s:v for s in series_names}, index=data_index)
+
+## doy but from Jul 1
+def proc_days_from_Jul_1(df, data_index, series_names):
+    m = 7
+    f = lambda x: (x - pd.Timestamp(x.year-int(x.month<m),m,1)).days
+    v = np.array(-2.0 + 4.0 * pd.to_datetime(data_index).map(f).values / 366.0, dtype=np.float32) 
+    return pd.DataFrame({s:v for s in series_names}, index=data_index)
 
 ## normalize by global mean and std to avoid losing per-series information
 def norm_global_Z(df):
@@ -612,6 +656,10 @@ def norm_global_Z(df):
 ## scale by series mean
 def norm_mean_scale(df):
     return df.apply(lambda s: s / s.mean())
+
+## scale by series 95th percentile
+def norm_95_scale(df):
+    return df.apply(lambda s: s / np.nanpercentile(s, 95))
 
 ## Z by series
 def norm_Z(df):

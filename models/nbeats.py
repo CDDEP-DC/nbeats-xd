@@ -195,15 +195,20 @@ class NBeats_wnorm(t.nn.Module):
     """
     N-Beats Model, but with optional windowed normalization; univariate
     """
-    def __init__(self, blocks: t.nn.ModuleList, use_norm: bool = True):
+    def __init__(self, blocks: t.nn.ModuleList, use_norm: bool = True, norm_mean: bool = False):
         super().__init__()
         self.nbeats = NBeats_stack(blocks)
         self.use_norm = use_norm ## seems to improve forecasts
+        self.norm_mean = norm_mean
 
     def forward(self, x_raw: t.Tensor, input_mask: t.Tensor, static_cat: Optional[t.Tensor] = None, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
         ## normalize by window
         if self.use_norm:
-            norm = x_raw.median(dim=1,keepdim=True).values # .mean(dim=1,keepdim=True) #
+            if self.norm_mean:
+                norm = x_raw.mean(dim=1,keepdim=True)
+            else:
+                norm = x_raw.median(dim=1,keepdim=True).values
+
             x = x_raw / norm
         else:
             x = x_raw.clone()
@@ -223,16 +228,21 @@ class NBeats_var(t.nn.Module):
     """
     univariate version with error variance
     """
-    def __init__(self, blocks: t.nn.ModuleList, blocks_var: t.nn.ModuleList, use_norm: bool = False, force_positive: bool = False):
+    def __init__(self, blocks: t.nn.ModuleList, blocks_var: t.nn.ModuleList, use_norm: bool = False, force_positive: bool = False, norm_mean: bool = False):
         super().__init__()
         self.nbeats = NBeats_stack(blocks, force_positive) ## force forecast to be positive?
         self.nbeats_var = NBeats_stack(blocks_var, True) ## always force positive variance
         self.use_norm = use_norm ## variance estimation maybe doesn't get along with windowed normalization?
+        self.norm_mean = norm_mean
         
     def forward(self, x_raw: t.Tensor, input_mask: t.Tensor, static_cat: Optional[t.Tensor] = None, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
         ## normalize by window
         if self.use_norm:
-            norm = x_raw.median(dim=1,keepdim=True).values + 1e-6 #x_raw.mean(dim=1,keepdim=True) + 1e-6 #
+            if self.norm_mean:
+                norm = x_raw.mean(dim=1,keepdim=True) + 1e-6 
+            else:
+                norm = x_raw.median(dim=1,keepdim=True).values + 1e-6
+
             x = x_raw / norm
         else:
             x = x_raw.clone()
@@ -263,11 +273,12 @@ class NB_decoder(t.nn.Module):
     point forecasts, no error variance
     """
 
-    def __init__(self, blocks: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = True):
+    def __init__(self, blocks: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = True, norm_mean: bool = False):
         super().__init__()
         self.nbeats = NBeats_stack(blocks)
         self.exog_block = exog_block  ## just an encoder
         self.use_norm = use_norm ## seems to improve forecasts
+        self.norm_mean = norm_mean
 
     def forward(self, all_vars: t.Tensor, input_mask: t.Tensor, static_cat: t.Tensor, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
         ## first variable is the forecast target; rest are exogenous covariates
@@ -277,7 +288,11 @@ class NB_decoder(t.nn.Module):
         ## normalize target by window median
         ## covars should be normalized at the dataset level (by window doesn't make sense)
         if self.use_norm:
-            norm = x_raw.median(dim=1,keepdim=True).values
+            if self.norm_mean:
+                norm = x_raw.mean(dim=1,keepdim=True)
+            else:
+                norm = x_raw.median(dim=1,keepdim=True).values
+
             x = x_raw / norm
             covars[:,:,0] = x ## replace with normalized
         else:
@@ -303,12 +318,13 @@ class NB_dec_var(t.nn.Module):
     estimates error variance
     """
 
-    def __init__(self, blocks: t.nn.ModuleList, blocks_var: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = False, force_positive: bool = False):
+    def __init__(self, blocks: t.nn.ModuleList, blocks_var: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = False, force_positive: bool = False, norm_mean: bool = False):
         super().__init__()
         self.nbeats = NBeats_stack(blocks, force_positive) ## force forecast to be positive?
         self.nbeats_var = NBeats_stack(blocks_var, True) ## always force positive variance
         self.exog_block = exog_block  ## just an encoder
         self.use_norm = use_norm ## variance estimation maybe doesn't get along with windowed normalization?
+        self.norm_mean = norm_mean
 
     def forward(self, all_vars: t.Tensor, input_mask: t.Tensor, static_cat: t.Tensor, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
         ## first variable is the forecast target; rest are exogenous covariates
@@ -318,7 +334,11 @@ class NB_dec_var(t.nn.Module):
         ## normalize by window
         ## covars should be normalized at the dataset level (by window doesn't make sense)
         if self.use_norm:
-            norm = x_raw.median(dim=1,keepdim=True).values + 1e-6 #x_raw.mean(dim=1,keepdim=True) + 1e-6 #
+            if self.norm_mean:
+                norm = x_raw.mean(dim=1,keepdim=True) + 1e-6 
+            else:
+                norm = x_raw.median(dim=1,keepdim=True).values + 1e-6
+
             x = x_raw / norm
             covars[:,:,0] = x ## replace with normalized
         else:
@@ -352,13 +372,14 @@ class NB2stage(t.nn.Module):
     as NB_dec_var, but uses separate stacks for target var and exogenous predictors
     """
 
-    def __init__(self, blocks1: t.nn.ModuleList, blocks2: t.nn.ModuleList, blocks_var: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = False, force_positive: bool = False):
+    def __init__(self, blocks1: t.nn.ModuleList, blocks2: t.nn.ModuleList, blocks_var: t.nn.ModuleList, exog_block: t.nn.Module, use_norm: bool = False, force_positive: bool = False, norm_mean: bool = False):
         super().__init__()
         self.nbeats1 = NBeats_stack(blocks1, False)
         self.nbeats2 = NBeats_stack(blocks2, force_positive) ## force forecast to be positive?
         self.nbeats_var = NBeats_stack(blocks_var, True) ## always force positive variance
         self.exog_block = exog_block  ## just an encoder
         self.use_norm = use_norm ## variance estimation maybe doesn't get along with windowed normalization?
+        self.norm_mean = norm_mean
 
     def forward(self, all_vars: t.Tensor, input_mask: t.Tensor, static_cat: t.Tensor, forecast_target: Optional[t.Tensor] = None) -> t.Tensor:
         ## first variable is the forecast target; rest are exogenous covariates
@@ -367,7 +388,11 @@ class NB2stage(t.nn.Module):
         ## normalize by window
         ## covars should be normalized at the dataset level (by window doesn't make sense)
         if self.use_norm:
-            norm = x_raw.median(dim=1,keepdim=True).values + 1e-6 #x_raw.mean(dim=1,keepdim=True) + 1e-6 #
+            if self.norm_mean:
+                norm = x_raw.mean(dim=1,keepdim=True) + 1e-6 
+            else:
+                norm = x_raw.median(dim=1,keepdim=True).values + 1e-6
+                
             x = x_raw / norm
         else:
             x = x_raw.clone()
