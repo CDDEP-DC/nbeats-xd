@@ -164,7 +164,8 @@ def append_forecasts(df, filepath):
         x = None
         
     df_plt = pd.concat([x,df_plt],ignore_index=True)
-    df_plt.to_csv(filepath)
+    df_plt.to_csv(filepath,index=False)
+    return None
 
 
 
@@ -206,7 +207,7 @@ def read_flu_data():
                     'Connecticut',
                     'Georgia',
                     'Maryland',
-                    'Michigan',
+                    #'Michigan',  ## disappeared??
                     'Minnesota',
                     #'New Mexico',  ## missing surveillance
                     'New York - Albany',
@@ -251,10 +252,11 @@ def read_flu_data():
     ## flusurv-net hospitalization rates per 100k (participating regions from 2009-)
     ## from fluview: https://gis.cdc.gov/GRASP/Fluview/FluHospRates.html
     ##
-    flu_hosp = pd.read_csv(os.path.join(data_dir,"flu_surv_net.csv"),dtype=str).query("`AGE CATEGORY`=='Overall' and `SEX CATEGORY`=='Overall' and `RACE CATEGORY`=='Overall'")
-    flu_hosp = flu_hosp[['CATCHMENT', 'NETWORK', 'MMWR-YEAR', 'MMWR-WEEK', 'WEEKLY RATE']].copy()
-    flu_hosp["MMWR-YEAR"] = flu_hosp["MMWR-YEAR"].astype(int)
-    flu_hosp["MMWR-WEEK"] = flu_hosp["MMWR-WEEK"].astype(int)
+    flu_hosp = pd.read_csv(os.path.join(data_dir,"flu_surv_net.csv"),dtype=str).query(
+        "`AGE CATEGORY`=='Overall' and `SEX CATEGORY`=='Overall' and `RACE CATEGORY`=='Overall' and `VIRUS TYPE CATEGORY`=='Overall'")
+    flu_hosp = flu_hosp[['CATCHMENT', 'YEAR.1', 'WEEK', 'WEEKLY RATE']].copy()
+    flu_hosp["MMWR-YEAR"] = flu_hosp["YEAR.1"].astype(int)
+    flu_hosp["MMWR-WEEK"] = flu_hosp["WEEK"].astype(int)
     flu_hosp["WEEKLY RATE"] = flu_hosp["WEEKLY RATE"].astype(float)
     flu_hosp["date"] = flu_hosp["MMWR-YEAR"].map(mmwr_start) + flu_hosp["MMWR-WEEK"].map(mmwr_delta)
 
