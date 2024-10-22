@@ -326,7 +326,7 @@ def make_training_fn(rstate):
     train_fn = trainer_validation if rstate.calc_validation else trainer_var
 
     ## result fn returns forecast; model is saved in snapshots folder
-    def ret_fn(model_name, settings):
+    def ret_fn(model_name, settings, pretrained_model_file=None):
         ## switch target columns if using normalized target
         if settings.normalize_target:
             target_key = "_SCALED"
@@ -386,6 +386,7 @@ def make_training_fn(rstate):
                         loss_name=settings.lfn_name,
                         iterations=settings.iterations,
                         learning_rate=settings.init_LR,
+                        pretrained_model_file=pretrained_model_file,
                         validation_input = train_ds.last_insample_window() if rstate.test_targets is not None else None,
                         validation_data = rstate.test_targets[:,0:settings.horizon] if rstate.test_targets is not None else None)
         
@@ -557,7 +558,7 @@ def plotpred(forecasts, ser, training_targets, test_targets, horizon, lower_fc=N
 def output_figs(rstate, horizon, series_idxs, x_width, colors=["black","orangered"], figsize=(7,5), plot_mean=False, k=None):
     train_targets = rstate.nat_targets
     test_targets = rstate.test_targets ## read only
-    if rstate.reverse_transform is not None:
+    if (rstate.reverse_transform is not None) and (test_targets is not None):
         test_targets = rstate.reverse_transform(test_targets)
 
     output_dir = rstate.output_dir

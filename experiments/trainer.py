@@ -47,6 +47,7 @@ def trainer(snapshot_manager: SnapshotManager,
             loss_name: str,
             iterations: int,
             learning_rate: float = 0.001,
+            pretrained_model_file = None,
             **kwargs):
 
     timeseries_frequency = kwargs.get("timeseries_frequency", 0)
@@ -60,7 +61,12 @@ def trainer(snapshot_manager: SnapshotManager,
     if lr_decay_step == 0:
         lr_decay_step = 1
 
-    iteration = snapshot_manager.restore(model, optimizer)
+    ## if a model file was provided, don't try to restore from snapshot folder
+    if pretrained_model_file is None:
+        iteration = snapshot_manager.restore(model, optimizer)
+    else:
+        model.load_state_dict(t.load(pretrained_model_file))
+        iteration = 0
 
     #
     # Training Loop
@@ -164,6 +170,7 @@ def trainer_var(snapshot_manager: SnapshotManager,
             loss_name: str,
             iterations: int,
             learning_rate: float = 0.001,
+            pretrained_model_file = None,
             **kwargs):
 
     model = model.to(default_device())
@@ -175,7 +182,12 @@ def trainer_var(snapshot_manager: SnapshotManager,
     if lr_decay_step == 0:
         lr_decay_step = 1
 
-    iteration = snapshot_manager.restore(model, optimizer)
+    ## if a model file was provided, don't try to restore from snapshot folder
+    if pretrained_model_file is None:
+        iteration = snapshot_manager.restore(model, optimizer)
+    else:
+        model.load_state_dict(t.load(pretrained_model_file))
+        iteration = 0
 
     #
     # Training Loop
@@ -222,6 +234,7 @@ def trainer_validation(snapshot_manager: SnapshotManager,
             loss_name: str,
             iterations: int,
             learning_rate: float = 0.001,
+            pretrained_model_file = None,
             **kwargs):
 
     validation_input = kwargs.get("validation_input",None)
@@ -239,7 +252,12 @@ def trainer_validation(snapshot_manager: SnapshotManager,
     if lr_decay_step == 0:
         lr_decay_step = 1
 
-    iteration = snapshot_manager.restore(model, optimizer)
+    ## if a model file was provided, don't try to restore from snapshot folder
+    if pretrained_model_file is None:
+        iteration = snapshot_manager.restore(model, optimizer)
+    else:
+        model.load_state_dict(t.load(pretrained_model_file))
+        iteration = 0
 
     #
     # Training Loop
