@@ -8,5 +8,6 @@
 "encoder_hidden_dim": 256,
 "encoder_dropout": 0.2,
 "nbeats_dropout": 0.2,
-"windowed_norm_mean": 1
+"windowed_norm_mean": 1,
+"lfn_name": "t_pen"
 }

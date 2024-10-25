@@ -34,6 +34,7 @@ from common.torch.ops import default_device, to_tensor, divide_no_nan
 from torch.distributions.studentT import StudentT
 #from torch.distributions.cauchy import Cauchy
 #from torch.distributions.laplace import Laplace
+#from torch.distributions.normal import Normal
 from torch.distributions.gamma import Gamma
 
 ##
@@ -150,6 +151,28 @@ def gamma_nll_loss(forecast_mu, target, variance):
 #    m = Laplace(forecast_mu, s)
 #    return -1.0 * t.mean(t.sum(m.log_prob(target),dim=1))
 
+## t loss with additional penalty for largest error in each forecast horizon
+def t_nll_pen(forecast_mu, target, variance):
+    n = 5.0
+    eps = 1e-6
+    s = t.sqrt(variance + eps)
+    m = StudentT(n, forecast_mu, s)
+    ## note, using mean instead of sum as reduction:
+    mean_LL = -1.0 * t.mean(m.log_prob(target))
+
+    se = t.square(forecast_mu - target)
+    W = t.nn.functional.softmax(se, dim=1)
+    ## differentializable approximation:
+    largest_err = t.sum(W * se, dim=1)
+    ## normalizing the squared error by the square of the forecast (make the scale match mean_LL above):
+    normalizer = t.sum(W * t.square(forecast_mu), dim=1) + eps
+    ## x 4 because normalizer is probably too high (like having st dev = the forecast value)
+    penalty = 4.0 * t.mean(largest_err/normalizer)
+
+    return mean_LL + penalty
+
+
+
 def __ll_fn(loss_name: str):
     if loss_name == 't_nll':
         return t_nll_loss
@@ -157,6 +180,8 @@ def __ll_fn(loss_name: str):
         return t.nn.functional.gaussian_nll_loss
     elif loss_name == 'gamma_nll':
         return gamma_nll_loss
+    elif loss_name == 't_pen':
+        return t_nll_pen
     else:
         raise Exception(f'Unknown loss function: {loss_name}')
 

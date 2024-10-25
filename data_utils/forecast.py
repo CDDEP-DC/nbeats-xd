@@ -74,7 +74,7 @@ def default_settings(filename="settings.json"):
     settings.horizon = d.get("horizon",40) #6
 
     ## loss function (defined in experiments/trainer.py)
-    settings.lfn_name = d.get("lfn_name","t_nll")
+    settings.lfn_name = d.get("lfn_name","t_nll")  ## t_nll / norm_nll / t_pen
     settings.force_positive_forecast = bool(d.get("force_positive_forecast",False)) ## if loss fn requires > 0
     settings.normalize_target = bool(d.get("normalize_target",False)) ## normalize the target var before passing to model? (see notes below)
     settings.use_windowed_norm = bool(d.get("use_windowed_norm",True)) ## normalize inside the model by window? (tends to improve forecasts; ref. Smyl 2020)
