@@ -34,39 +34,59 @@ from typing import Optional
 ## NOTE: this version assumes all timeseries are same length
 ## never samples past the beginning/end
 ## mask is disabled (returns a dummy mask)
+##
 ## returns a torch IterableDataset
+## this is then passed to torch DataLoader to handle batching
 ##
 ## if using timeseries of differing lengths, will need to re-enable mask
 ## or use original batch_sampler() below
 ##
 
+## note, if cut weights are provided, they are assumed to apply to [min_cut, max_cut] inclusive
+## ok to provide weights equal in length to time series, but they will be truncated and re-weighted
+## (assumed that each weight indicates probability of cutting at (=after) the indicated position)
+
 def ts_dataset(timeseries: np.ndarray, static_cat: Optional[np.ndarray],
                  insample_size: int,
                  outsample_size: int,
-                 window_sampling_limit: int):
+                 window_sampling_limit: int,
+                 cut_weights = None):
     if timeseries.ndim == 2:
-        return TimeDatasetUV(timeseries,insample_size,outsample_size,window_sampling_limit)
+        return TimeDatasetUV(timeseries,insample_size,outsample_size,window_sampling_limit,cut_weights)
     else:
-        return TimeDatasetMV(timeseries,static_cat,insample_size,outsample_size,window_sampling_limit)
+        return TimeDatasetMV(timeseries,static_cat,insample_size,outsample_size,window_sampling_limit,cut_weights)
 
+##
+## NOTE: to_tensor() puts training data in GPU memory to avoid extra copying later
+## if there are many GB of data, don't do this
+##
 
-## dataset version, univariate; to_tensor() puts data in gpu memory -- does this help?
+## dataset version, univariate
 class TimeDatasetUV(IterableDataset):
     def __init__(self,
                  ts_np: np.ndarray,
                  insample_size: int,
                  outsample_size: int,
-                 window_sampling_limit: int):
+                 window_sampling_limit: int,
+                 cut_weights = None):
 
         self.timeseries = to_tensor(ts_np) ## shape is [series, time], all the same length
         self.static_cat = t.zeros(ts_np.shape[0],dtype=int,device=default_device()) ## currently no category data in univar case
         self.insample_size = insample_size
         self.outsample_size = outsample_size
         self.n_series, self.ts_len = ts_np.shape
-        self.min_cut = max(self.insample_size, self.ts_len - window_sampling_limit)
-        self.max_cut = self.ts_len - self.outsample_size
         self.mask = to_tensor(np.ones(1)) ## dummy mask, model expects it
         self.rng = np.random.default_rng()
+        min_cut = max(self.insample_size, self.ts_len - window_sampling_limit)
+        max_cut = self.ts_len - self.outsample_size
+        self.cut_options = range(min_cut, max_cut+1)
+        if cut_weights is not None:
+            if len(cut_weights) > len(self.cut_options):
+                cut_weights = cut_weights[:max_cut]
+            if len(cut_weights) > len(self.cut_options):
+                cut_weights = cut_weights[(min_cut-1):]
+            cut_weights = cut_weights / np.sum(cut_weights,dtype=float)
+        self.cut_weights = cut_weights
 
     def __iter__(self):
         """
@@ -78,7 +98,8 @@ class TimeDatasetUV(IterableDataset):
         """
         while True:
             i = self.rng.integers(self.n_series)
-            cut_point = self.rng.integers(self.min_cut, self.max_cut, endpoint=True)
+            #cut_point = self.rng.integers(self.min_cut, self.max_cut, endpoint=True)
+            cut_point = self.rng.choice(self.cut_options, p=self.cut_weights)
             insample = self.timeseries[i, (cut_point - self.insample_size):cut_point]
             outsample = self.timeseries[i, cut_point:(cut_point + self.outsample_size)]
             yield insample, self.mask, self.static_cat[i], outsample, self.mask 
@@ -96,7 +117,8 @@ class TimeDatasetMV(IterableDataset):
                  ts_np: np.ndarray, static_cat: Optional[np.ndarray],
                  insample_size: int,
                  outsample_size: int,
-                 window_sampling_limit: int):
+                 window_sampling_limit: int,
+                 cut_weights = None):
 
         self.timeseries = to_tensor(ts_np) ## shape is [series, time, variables], all the same length
         if static_cat is not None:
@@ -106,10 +128,18 @@ class TimeDatasetMV(IterableDataset):
         self.insample_size = insample_size
         self.outsample_size = outsample_size
         self.n_series, self.ts_len, self.n_variables = ts_np.shape
-        self.min_cut = max(self.insample_size, self.ts_len - window_sampling_limit)
-        self.max_cut = self.ts_len - self.outsample_size
         self.mask = to_tensor(np.ones(1)) ## dummy mask, model expects it
         self.rng = np.random.default_rng()
+        min_cut = max(self.insample_size, self.ts_len - window_sampling_limit)
+        max_cut = self.ts_len - self.outsample_size
+        self.cut_options = range(min_cut, max_cut+1)
+        if cut_weights is not None:
+            if len(cut_weights) > len(self.cut_options):
+                cut_weights = cut_weights[:max_cut]
+            if len(cut_weights) > len(self.cut_options):
+                cut_weights = cut_weights[(min_cut-1):]
+            cut_weights = cut_weights / np.sum(cut_weights,dtype=float)
+        self.cut_weights = cut_weights
 
     def __iter__(self):
         """
@@ -121,7 +151,8 @@ class TimeDatasetMV(IterableDataset):
         """
         while True:
             i = self.rng.integers(self.n_series)
-            cut_point = self.rng.integers(self.min_cut, self.max_cut, endpoint=True)
+            #cut_point = self.rng.integers(self.min_cut, self.max_cut, endpoint=True)
+            cut_point = self.rng.choice(self.cut_options, p=self.cut_weights)
             insample = self.timeseries[i, (cut_point - self.insample_size):cut_point, :] ## all vars, incl first
             outsample = self.timeseries[i, cut_point:(cut_point + self.outsample_size), 0] ## first variable only
             yield insample, self.mask, self.static_cat[i], outsample, self.mask
@@ -138,7 +169,8 @@ class TimeDatasetMV(IterableDataset):
 
 
 
-
+## sampler below is the original version from NBEATS repo
+## handles the batching itself
 
 ## batch sampler sometimes samples past ts start/end, resulting in truncated samples
 ## don't know if that's good or bad

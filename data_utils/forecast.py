@@ -94,7 +94,8 @@ def default_settings(filename="settings.json"):
     settings.enc_temporal = d.get("enc_temporal",True) ## encode exog predictors in a way that preserves temporal structure ?
     settings.static_cat_embed_dim = d.get("static_cat_embed_dim",3) ## dimension of vector embedding if using static_categories
     settings.history_size_in_horizons = d.get("history_size_in_horizons",1000) ## maximum length of history to consider for training, in # of horizons
-
+    settings.cut_weights = None
+    
     return settings
 
 
@@ -372,7 +373,8 @@ def make_training_fn(rstate):
         train_ds = ts_dataset(timeseries=training_values, static_cat=rstate.static_cat,
                                         insample_size=input_size,
                                         outsample_size=settings.horizon,
-                                        window_sampling_limit=int(settings.history_size_in_horizons * settings.horizon))
+                                        window_sampling_limit=int(settings.history_size_in_horizons * settings.horizon),
+                                        cut_weights=settings.cut_weights)
 
         training_set = DataLoader(train_ds,batch_size=settings.batch_size)
 
