@@ -207,7 +207,7 @@ def read_flu_data():
                     'Connecticut',
                     'Georgia',
                     'Maryland',
-                    #'Michigan',  ## disappeared??
+                    'Michigan',
                     'Minnesota',
                     #'New Mexico',  ## missing surveillance
                     'New York - Albany',

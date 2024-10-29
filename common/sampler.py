@@ -43,6 +43,7 @@ from typing import Optional
 ##
 
 ## note, if cut weights are provided, they are assumed to apply to [min_cut, max_cut] inclusive
+## cut weights dims are [series, timepoints]
 ## ok to provide weights equal in length to time series, but they will be truncated and re-weighted
 ## (assumed that each weight indicates probability of cutting at (=after) the indicated position)
 
@@ -80,13 +81,15 @@ class TimeDatasetUV(IterableDataset):
         min_cut = max(self.insample_size, self.ts_len - window_sampling_limit)
         max_cut = self.ts_len - self.outsample_size
         self.cut_options = range(min_cut, max_cut+1)
+        self.cut_weights = [None for i in range(self.n_series)]
         if cut_weights is not None:
-            if len(cut_weights) > len(self.cut_options):
-                cut_weights = cut_weights[:max_cut]
-            if len(cut_weights) > len(self.cut_options):
-                cut_weights = cut_weights[(min_cut-1):]
-            cut_weights = cut_weights / np.sum(cut_weights,dtype=float)
-        self.cut_weights = cut_weights
+            for (i,W) in enumerate(cut_weights):
+                if len(W) > len(self.cut_options):
+                    W = W[:max_cut]
+                if len(W) > len(self.cut_options):
+                    W = W[(min_cut-1):]
+                W = W / np.sum(W,dtype=float)
+                self.cut_weights[i] = W
 
     def __iter__(self):
         """
@@ -99,7 +102,7 @@ class TimeDatasetUV(IterableDataset):
         while True:
             i = self.rng.integers(self.n_series)
             #cut_point = self.rng.integers(self.min_cut, self.max_cut, endpoint=True)
-            cut_point = self.rng.choice(self.cut_options, p=self.cut_weights)
+            cut_point = self.rng.choice(self.cut_options, p=self.cut_weights[i])
             insample = self.timeseries[i, (cut_point - self.insample_size):cut_point]
             outsample = self.timeseries[i, cut_point:(cut_point + self.outsample_size)]
             yield insample, self.mask, self.static_cat[i], outsample, self.mask 
@@ -133,13 +136,15 @@ class TimeDatasetMV(IterableDataset):
         min_cut = max(self.insample_size, self.ts_len - window_sampling_limit)
         max_cut = self.ts_len - self.outsample_size
         self.cut_options = range(min_cut, max_cut+1)
+        self.cut_weights = [None for i in range(self.n_series)]
         if cut_weights is not None:
-            if len(cut_weights) > len(self.cut_options):
-                cut_weights = cut_weights[:max_cut]
-            if len(cut_weights) > len(self.cut_options):
-                cut_weights = cut_weights[(min_cut-1):]
-            cut_weights = cut_weights / np.sum(cut_weights,dtype=float)
-        self.cut_weights = cut_weights
+            for (i,W) in enumerate(cut_weights):
+                if len(W) > len(self.cut_options):
+                    W = W[:max_cut]
+                if len(W) > len(self.cut_options):
+                    W = W[(min_cut-1):]
+                W = W / np.sum(W,dtype=float)
+                self.cut_weights[i] = W
 
     def __iter__(self):
         """
@@ -152,7 +157,7 @@ class TimeDatasetMV(IterableDataset):
         while True:
             i = self.rng.integers(self.n_series)
             #cut_point = self.rng.integers(self.min_cut, self.max_cut, endpoint=True)
-            cut_point = self.rng.choice(self.cut_options, p=self.cut_weights)
+            cut_point = self.rng.choice(self.cut_options, p=self.cut_weights[i])
             insample = self.timeseries[i, (cut_point - self.insample_size):cut_point, :] ## all vars, incl first
             outsample = self.timeseries[i, cut_point:(cut_point + self.outsample_size), 0] ## first variable only
             yield insample, self.mask, self.static_cat[i], outsample, self.mask
