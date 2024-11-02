@@ -194,6 +194,41 @@ def weekly_reduce(df, fn, date_idx):
         data.append(df.loc[d0:d1,:].apply(fn))
     return pd.DataFrame(data,index=date_idx)
 
+## replaces zeros and NaNs in input_df with interpolated values from the surrounding non-zero points
+## and adds noise on the scale of +/- noise_scale
+## if the surrounding points are farther apart than bend_thresh, inserts a value equal to noise_scale at the midpoint
+## rounds the final result to data_precision decimal points
+## any final values of 0 are replaced with 0.5 * noise_scale
+def zeros_to_noise(input_df, noise_scale, bend_thresh, data_precision):
+
+    ## locations of zeros or nans:
+    df0 = (input_df.fillna(0) < (0.5*noise_scale))
+    zero_idxs = df0.apply(lambda s:np.nonzero(s)[0]).to_list()
+    zero_spans = [list(zip(x[(np.diff(x,prepend=-99))>1], x[(np.diff(x[::-1],prepend=99+max(x,default=0))[::-1])<-1])) for x in zero_idxs]
+    long_zero_spans = [[x for x in v if ((x[1]-x[0])>(bend_thresh-1))] for v in zero_spans]
+    zero_midpoints = [[int(np.round(np.mean(p))) for p in v] for v in long_zero_spans]
+
+    ## don't modify input df
+    df = input_df.copy(deep=True)
+
+    ## changes zeros to nans
+    df[df0] = np.nan
+    ## before interpolation, set midpoints of long spans to a small number
+    for (col_idx,v) in enumerate(zero_midpoints):
+        for idx in v:
+            df.iloc[idx,col_idx] = noise_scale
+    
+    ## only interpolate between
+    df = df.interpolate(method="linear",limit_area="inside").ffill().bfill()
+    ## add noise where the data were zero or missing
+    rng = np.random.default_rng()
+    df_rand = pd.DataFrame((-1.0 * noise_scale) + (2.0 * noise_scale * rng.random(df.shape)), index=df.index, columns=df.columns)
+    df[df0] = df[df0] + df_rand[df0]
+    ## round to the precision of the original data
+    df = df.round(data_precision)
+    ## don't actually allow zero values though
+    df = df.apply(lambda s: np.maximum(s,(0.5*noise_scale)))
+    return df
 
 ## preprocess downloaded flu data
 ## output csv's with columns = series and rows = dates
@@ -240,36 +275,37 @@ def read_flu_data():
     series_distances = dfDist(flu_true)
 
     ## don't allow zero (model can't handle an input window of all 0's; also it's probably not true)
-    ## fill zero or missing counts with 0.5
-    flu_true_count[flu_true_count < 0.5] = np.nan
-    flu_true_count = flu_true_count.fillna(0.5)
-    ## fill zero or missing per-capita with equivalent value
-    small_values = census.map(lambda x: 50000.0 / x)
-    flu_true[flu_true < 0.0001] = np.nan
-    flu_true = flu_true.apply(lambda s: s.fillna(small_values[s.name]))
+    flu_true_pop = (flu_true_count / flu_true).round(8).ffill().bfill()
+    flu_true_count = zeros_to_noise(flu_true_count, 2, 6, 0)
+    flu_true = flu_true_count / flu_true_pop 
 
     ##
     ## flusurv-net hospitalization rates per 100k (participating regions from 2009-)
     ## from fluview: https://gis.cdc.gov/GRASP/Fluview/FluHospRates.html
     ##
-    flu_hosp = pd.read_csv(os.path.join(data_dir,"flu_surv_net.csv"),dtype=str).query(
+    flu_hosp = pd.read_csv(os.path.join(data_dir,"flu_surv_current.csv"),dtype=str).query(
         "`AGE CATEGORY`=='Overall' and `SEX CATEGORY`=='Overall' and `RACE CATEGORY`=='Overall' and `VIRUS TYPE CATEGORY`=='Overall'")
     flu_hosp = flu_hosp[['CATCHMENT', 'YEAR.1', 'WEEK', 'WEEKLY RATE']].copy()
+    ## append to data from previous years
+    flu_hosp = pd.concat([
+        pd.read_csv(os.path.join(data_dir,"flu_surv_hist.csv"),dtype=str), 
+        flu_hosp
+        ], ignore_index=True)
+    ## process columns
     flu_hosp["MMWR-YEAR"] = flu_hosp["YEAR.1"].astype(int)
     flu_hosp["MMWR-WEEK"] = flu_hosp["WEEK"].astype(int)
     flu_hosp["WEEKLY RATE"] = flu_hosp["WEEKLY RATE"].astype(float)
     flu_hosp["date"] = flu_hosp["MMWR-YEAR"].map(mmwr_start) + flu_hosp["MMWR-WEEK"].map(mmwr_delta)
 
-    ## assume each flu-surv sampling area represents its state
-    ## (produces an expected state-wide count, for possible use as forecast target)
-    flu_hosp = flu_hosp.merge(census,left_on="CATCHMENT",right_index=True)
-    flu_hosp["count"] = flu_hosp["WEEKLY RATE"] * flu_hosp["POPESTIMATE2023"] / 100000.0
-
     ##
     ## who/nrevss clinical lab surveillance data (all US states from 2015-)
     ## from fluview: https://gis.cdc.gov/grasp/fluview/fluportaldashboard.html
     ##
-    surveil = pd.read_csv(os.path.join(data_dir,"NREVSS_Clinical.csv"),usecols=['REGION', 'YEAR', 'WEEK', 'TOTAL SPECIMENS','PERCENT POSITIVE'],dtype=str)
+    surveil = pd.concat([
+                pd.read_csv(os.path.join(data_dir,"NREVSS_Clinical_hist.csv"),usecols=['REGION', 'YEAR', 'WEEK', 'TOTAL SPECIMENS','PERCENT POSITIVE'],dtype=str),
+                pd.read_csv(os.path.join(data_dir,"NREVSS_Clinical_current.csv"),usecols=['REGION', 'YEAR', 'WEEK', 'TOTAL SPECIMENS','PERCENT POSITIVE'],dtype=str)
+                ], ignore_index=True)
+    ## process columns
     surveil["YEAR"] = surveil["YEAR"].astype(int)
     surveil["WEEK"] = surveil["WEEK"].astype(int)
     surveil["TOTAL SPECIMENS"] = pd.to_numeric(surveil["TOTAL SPECIMENS"],errors="coerce")
@@ -302,7 +338,11 @@ def read_flu_data():
     ## ilinet outpatient surveillance data (all US states from 2010-)
     ## from fluview: https://gis.cdc.gov/grasp/fluview/fluportaldashboard.html
     ##
-    outp = pd.read_csv(os.path.join(data_dir,"ILINet.csv"),usecols=['REGION', 'YEAR', 'WEEK', '%UNWEIGHTED ILI', 'ILITOTAL', 'TOTAL PATIENTS'],dtype=str)
+    outp = pd.concat([
+            pd.read_csv(os.path.join(data_dir,"ILINet_hist.csv"),usecols=['REGION', 'YEAR', 'WEEK', '%UNWEIGHTED ILI', 'ILITOTAL', 'TOTAL PATIENTS'],dtype=str),
+            pd.read_csv(os.path.join(data_dir,"ILINet_current.csv"),usecols=['REGION', 'YEAR', 'WEEK', '%UNWEIGHTED ILI', 'ILITOTAL', 'TOTAL PATIENTS'],dtype=str)
+            ], ignore_index=True)
+    ## process columns
     outp["YEAR"] = outp["YEAR"].astype(int)
     outp["WEEK"] = outp["WEEK"].astype(int)
     outp["%UNWEIGHTED ILI"] = pd.to_numeric(outp["%UNWEIGHTED ILI"],errors="coerce")
@@ -319,35 +359,21 @@ def read_flu_data():
     ## use flu-net data only from the time period when surveillance data is available
     ## per 100k capita
     flunet = pd.DataFrame(index=data_index).join(flu_hosp.pivot(index="date",columns="CATCHMENT",values="WEEKLY RATE")[series_names])
-    ## expected state-wide counts
-    flunet_count = pd.DataFrame(index=data_index).join(flu_hosp.pivot(index="date",columns="CATCHMENT",values="count")[series_names])
-
-    ## don't allow zero (model can't handle an input window of all 0's; also it's probably not true)
-    flunet[flunet < 0.05] = np.nan
-    ## fill zero or missing per-capita with a small random number?
-    #rng = np.random.default_rng()
-    #small_rand = pd.DataFrame(0.02 + 0.02 * rng.random(flunet.shape) ,index=flunet.index, columns=flunet.columns)
-    #flunet = flunet.fillna(small_rand)
-    ## or just with 1/2 the smallest reported value?
-    flunet = flunet.fillna(0.05)
-
-    flunet_count[flunet_count < 0.5] = np.nan
-    ## fill zero or missing counts with a small random number?
-    #rng = np.random.default_rng()
-    #small_rand = pd.DataFrame(0.5 + 0.2 * rng.random(flunet_count.shape) ,index=flunet_count.index, columns=flunet_count.columns)
-    #flunet_count = flunet_count.fillna(small_rand)
-    ## or just with 0.5?
-    flunet_count = flunet_count.fillna(0.5)
+    ## don't allow 0's
+    flunet = zeros_to_noise(flunet, 0.1, 6, 1)
+    ## assume each flu-surv sampling area represents its state
+    ## (produces an expected state-wide count, for possible use as forecast target)
+    flunet_count = flunet.apply(lambda s: s * census[s.name]  / 100000.0)
 
     ## write csv's
-    flunet.round(6).to_csv(os.path.join(data_dir,"flunet_samples_per100k.csv"))
+    flunet.round(2).to_csv(os.path.join(data_dir,"flunet_samples_per100k.csv"))
     flunet_count.round(2).to_csv(os.path.join(data_dir,"flunet_samples_count.csv"))
 
     surveil.round(3).to_csv(os.path.join(data_dir,"flu_surveil_weekly.csv"))
     outp.round(6).to_csv(os.path.join(data_dir,"flu_outp_weekly.csv"))
 
     flu_true.round(6).to_csv(os.path.join(data_dir,"flusight_truth_per100k.csv"))
-    flu_true_count.astype(float).round(2).to_csv(os.path.join(data_dir,"flusight_truth_count.csv"))
+    flu_true_count.astype(float).round(1).to_csv(os.path.join(data_dir,"flusight_truth_count.csv"))
 
     ds = census[series_names]
     ds.to_csv(os.path.join(data_dir,"flunet_populations.csv"))
