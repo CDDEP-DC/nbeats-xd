@@ -78,7 +78,7 @@ def default_settings(filename="settings.json"):
     settings.force_positive_forecast = bool(d.get("force_positive_forecast",False)) ## if loss fn requires > 0
     settings.normalize_target = bool(d.get("normalize_target",False)) ## normalize the target var before passing to model? (see notes below)
     settings.use_windowed_norm = bool(d.get("use_windowed_norm",True)) ## normalize inside the model by window? (tends to improve forecasts; ref. Smyl 2020)
-    settings.windowed_norm_mean = bool(d.get("windowed_norm_mean",False)) ## use mean instead of median for windowed normalization
+    settings.target_norm_mean = bool(d.get("target_norm_mean",False)) ## use mean instead of median for target normalization
     settings.use_static_cat = bool(d.get("use_static_cat",False)) ## whether to use static_cat; current implementation always makes forecasts worse
 
     ## note, stacks is currently per-stage when using 2-stage model (experiments/model.py/generic_2stage)
@@ -204,13 +204,14 @@ def init_target_data(rstate, settings):
     ## save nat scale target for plotting etc.
     nat_targets = var_dfs["_NAT_SCALE"].to_numpy(dtype=np.float32).transpose() ## dims [series, time]
 
-    ## pre-generate normalized target values (for when settings.normalize_target = True)
-    ## NOTE: in the unscaled data, series with small values contribute less to the weight gradients
-    ##  scaling makes the model learn better from states with small populations, whose data is noisier and more error prone
-    ##  this could make the overall forecast worse; can maybe be compensated with more training iterations
-    var_dfs["_SCALED"] = var_dfs[target_var] / var_dfs[target_var].apply(np.nanmedian)
+    ## pre-generate normalized target values (only used when settings.normalize_target = True)
+    if settings.target_norm_mean:
+        norm_targ_scale = var_dfs[target_var].apply(np.nanmean)
+    else:
+        norm_targ_scale = var_dfs[target_var].apply(np.nanmedian)
+    var_dfs["_SCALED"] = var_dfs[target_var] / norm_targ_scale
     ## save the scaling separately in case we need to un-scale variance predictions
-    optional_inv_scale = var_dfs[target_var].apply(np.nanmedian).values[:,None] ## dims [series, 1]
+    optional_inv_scale = norm_targ_scale.values[:,None] ## dims [series, 1]
 
     ## in theory, series could have different lengths
     ## (TODO: sampler currently requries same length)
@@ -365,7 +366,7 @@ def make_training_fn(rstate):
         model_args.use_norm = settings.use_windowed_norm
         model_args.dropout = settings.nbeats_dropout
         model_args.force_positive = settings.force_positive_forecast
-        model_args.norm_mean = settings.windowed_norm_mean
+        model_args.norm_mean = settings.target_norm_mean
         ## call selected model constructor fn
         model = model_fn(model_args)
         

@@ -84,11 +84,12 @@ class TimeDatasetUV(IterableDataset):
         self.cut_weights = [None for i in range(self.n_series)]
         if cut_weights is not None:
             for (i,W) in enumerate(cut_weights):
-                if len(W) > len(self.cut_options):
-                    W = W[:max_cut]
-                if len(W) > len(self.cut_options):
-                    W = W[(min_cut-1):]
-                W = W / np.sum(W,dtype=float)
+                if W is not None:
+                    if len(W) > len(self.cut_options):
+                        W = W[:max_cut]
+                    if len(W) > len(self.cut_options):
+                        W = W[(min_cut-1):]
+                    W = W / np.sum(W,dtype=float)
                 self.cut_weights[i] = W
 
     def __iter__(self):
@@ -139,11 +140,12 @@ class TimeDatasetMV(IterableDataset):
         self.cut_weights = [None for i in range(self.n_series)]
         if cut_weights is not None:
             for (i,W) in enumerate(cut_weights):
-                if len(W) > len(self.cut_options):
-                    W = W[:max_cut]
-                if len(W) > len(self.cut_options):
-                    W = W[(min_cut-1):]
-                W = W / np.sum(W,dtype=float)
+                if W is not None:
+                    if len(W) > len(self.cut_options):
+                        W = W[:max_cut]
+                    if len(W) > len(self.cut_options):
+                        W = W[(min_cut-1):]
+                    W = W / np.sum(W,dtype=float)
                 self.cut_weights[i] = W
 
     def __iter__(self):

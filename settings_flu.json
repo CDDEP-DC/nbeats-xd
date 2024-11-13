@@ -2,12 +2,12 @@
 "iterations": 400,
 "init_LR": 0.0005,
 "batch_size": 128,
-"lookback": 4,
 "horizon": 6,
 "nbeats_stacks": 16,
 "encoder_hidden_dim": 256,
 "encoder_dropout": 0.2,
 "nbeats_dropout": 0.2,
-"windowed_norm_mean": 1,
-"lfn_name": "t_pen"
+"lfn_name": "t_pen",
+"ORIG_lfn_name": "t_nll",
+"target_norm_mean": 1
 }

@@ -89,6 +89,7 @@ def custom_ensemble(template, specs):
             x = deepcopy(template)
             x.lookback = opt
             x.nbeats_hidden_dim = opt * 2 * 6 * 8
+            #x.nbeats_hidden_dim = opt * 2 * 6 * 7
             settings_list.append(x)
     return settings_list
 
@@ -194,32 +195,40 @@ def weekly_reduce(df, fn, date_idx):
         data.append(df.loc[d0:d1,:].apply(fn))
     return pd.DataFrame(data,index=date_idx)
 
-## replaces zeros and NaNs in input_df with interpolated values from the surrounding non-zero points
-## and adds noise on the scale of +/- noise_scale
-## if the surrounding points are farther apart than bend_thresh, inserts a value equal to noise_scale at the midpoint
+## replaces zeros and NaNs in input_df with noise
+## if thresh is not None, interpolates between the surrounding non-zero points
+## - inserts a value equal to noise_scale at the midpoint if the surrounding points are farther apart than thresh
+## - then adds noise on the scale of +/- noise_scale
+## otherwise, just sets values to 0.5*noise_scale to 2*noise_scale
 ## rounds the final result to data_precision decimal points
 ## any final values of 0 are replaced with 0.5 * noise_scale
-def zeros_to_noise(input_df, noise_scale, bend_thresh, data_precision):
-
-    ## locations of zeros or nans:
-    df0 = (input_df.fillna(0) < (0.5*noise_scale))
-    zero_idxs = df0.apply(lambda s:np.nonzero(s)[0]).to_list()
-    zero_spans = [list(zip(x[(np.diff(x,prepend=-99))>1], x[(np.diff(x[::-1],prepend=99+max(x,default=0))[::-1])<-1])) for x in zero_idxs]
-    long_zero_spans = [[x for x in v if ((x[1]-x[0])>(bend_thresh-1))] for v in zero_spans]
-    zero_midpoints = [[int(np.round(np.mean(p))) for p in v] for v in long_zero_spans]
+def zeros_to_noise(input_df, noise_scale, thresh, data_precision):
 
     ## don't modify input df
     df = input_df.copy(deep=True)
 
+    ## locations of zeros or nans:
+    df0 = (input_df.fillna(0) < (0.5*noise_scale))
     ## changes zeros to nans
     df[df0] = np.nan
-    ## before interpolation, set midpoints of long spans to a small number
-    for (col_idx,v) in enumerate(zero_midpoints):
-        for idx in v:
-            df.iloc[idx,col_idx] = noise_scale
     
-    ## only interpolate between
-    df = df.interpolate(method="linear",limit_area="inside").ffill().bfill()
+    if thresh is not None:
+        zero_idxs = df0.apply(lambda s:np.nonzero(s)[0]).to_list()
+        zero_spans = [list(zip(x[(np.diff(x,prepend=-99))>1], x[(np.diff(x[::-1],prepend=99+max(x,default=0))[::-1])<-1])) for x in zero_idxs]
+        long_zero_spans = [[x for x in v if ((x[1]-x[0])>(thresh-1))] for v in zero_spans]
+        zero_midpoints = [[int(np.round(np.mean(p))) for p in v] for v in long_zero_spans]
+
+        ## before interpolation, set midpoints of long spans to a small number
+        for (col_idx,v) in enumerate(zero_midpoints):
+            for idx in v:
+                df.iloc[idx,col_idx] = noise_scale
+    
+        ## only interpolate between
+        df = df.interpolate(method="linear",limit_area="inside").ffill().bfill()
+
+    else:
+        df = df.fillna(noise_scale)
+
     ## add noise where the data were zero or missing
     rng = np.random.default_rng()
     df_rand = pd.DataFrame((-1.0 * noise_scale) + (2.0 * noise_scale * rng.random(df.shape)), index=df.index, columns=df.columns)
@@ -276,7 +285,8 @@ def read_flu_data():
 
     ## don't allow zero (model can't handle an input window of all 0's; also it's probably not true)
     flu_true_pop = (flu_true_count / flu_true).round(8).ffill().bfill()
-    flu_true_count = zeros_to_noise(flu_true_count, 2, 6, 0)
+    #flu_true_count = zeros_to_noise(flu_true_count, 2, 6, 0)
+    flu_true_count = zeros_to_noise(flu_true_count, 2, None, 0)
     flu_true = flu_true_count / flu_true_pop 
 
     ##
@@ -360,7 +370,8 @@ def read_flu_data():
     ## per 100k capita
     flunet = pd.DataFrame(index=data_index).join(flu_hosp.pivot(index="date",columns="CATCHMENT",values="WEEKLY RATE")[series_names])
     ## don't allow 0's
-    flunet = zeros_to_noise(flunet, 0.1, 6, 1)
+    #flunet = zeros_to_noise(flunet, 0.1, 6, 1)
+    flunet = zeros_to_noise(flunet, 0.1, None, 1)
     ## assume each flu-surv sampling area represents its state
     ## (produces an expected state-wide count, for possible use as forecast target)
     flunet_count = flunet.apply(lambda s: s * census[s.name]  / 100000.0)
