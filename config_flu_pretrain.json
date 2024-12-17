@@ -1,8 +1,8 @@
 {
-"target_file": "flusight_truth_per100k.csv",
-"weight_file": "flusight_weights.csv",
+"target_file": "flunet_samples_per100k.csv",
+"weight_file": "flunet_weights.csv",
 "data_dir": "storage/flu_training",
-"output_dir": "storage/flu_output",
+"output_dir": "storage/flu_output_flunet",
 "snapshot_dir": "storage/flu_snapshots",
 "output_prefix": "flu",
 "delete_models": 0,

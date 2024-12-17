@@ -1,6 +1,6 @@
 {
-"target_file": "covid_truth_weekly_per100k.csv",
-"weight_file": "fips_weights.csv",
+"target_file": "covid_hhs_weekly_per100k.csv",
+"weight_file": "hhs_weights.csv",
 "data_dir": "storage/training_data",
 "output_dir": "storage/output",
 "snapshot_dir": "storage/model_snapshots",

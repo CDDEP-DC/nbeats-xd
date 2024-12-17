@@ -309,6 +309,7 @@ def trainer_validation(snapshot_manager: SnapshotManager,
         for param_group in optimizer.param_groups:
             param_group["lr"] = learning_rate * 0.5 ** (i // lr_decay_step)
 
+        validation_loss = np.nan
         if validation_input is not None:
             x, x_mask, static_c = validation_input
             model.eval()

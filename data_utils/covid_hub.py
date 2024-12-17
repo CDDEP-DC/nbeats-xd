@@ -5,15 +5,18 @@ import sys
 import shutil
 import datetime
 import requests
+import json
 from typing import Dict
 from copy import deepcopy
+import zipfile
+import tarfile
 
 import numpy as np
 import pandas as pd
 
-from data_utils.forecast import tryJSON, Struct
-from data_utils.forecast import proc_t, proc_tdecay, proc_doy, proc_fwd_const, proc_const, proc_repeat_across
-from data_utils.forecast import norm_global_Z, norm_mean_scale, norm_global_max, norm_logZ_across, norm_Z_across
+from data_utils.forecast import tryJSON, Struct, str_indexed_csv
+from data_utils.forecast import proc_t, proc_tdecay, proc_doy, proc_fwd_const, proc_const, proc_repeat_across, proc_days_from_Jul_1
+from data_utils.forecast import norm_Z, norm_global_Z, norm_mean_scale, norm_global_max, norm_logZ_across, norm_Z_across
 
 
 ## additional functions for processing or generating exogenous predictors
@@ -57,6 +60,10 @@ def proc_tvoc(df, data_index, series_names):
     return pd.DataFrame({s:(2.0 * time_since_voc / np.max(time_since_voc))
                         for s in series_names}, index=data_index)
 
+## take sqrt, then scale by series mean
+def norm_sqrt_mean(df):
+    return df.apply(np.sqrt).apply(lambda s: s / s.mean())
+
 
 ## this struct contains domain-specific information used in specify_ensemble()
 ## and data_utils/forecast.py/load_exog_data()
@@ -65,7 +72,7 @@ def domain_defaults():
     x = Struct()
     
     ##  which exogenous predictors to use by default
-    x.exog_vars = ["doy","dewpC","wastewater"]
+    x.exog_vars = ["dfhy","dewpC","surveil"]
     
     ##  information needed to generate a model ensemble, used in specify_ensemble() below
     x.lookback_opts = [3,4,5,6]
@@ -75,41 +82,45 @@ def domain_defaults():
     ## information for reading exogenous predictors, used by data_utils/forecast.py/load_exog_data()
     ##
     ## arbitrary names
-    x.var_names = ["tempC","dewpC","tsa_by_pop",
-                "t","t_decay","doy",
-                "vacc_rate","t_voc",
-                "pop_density_2020","med_age_2023",
-                "wastewater",
-                "variant_p1","variant_p2","variant_p3",
-                "variant_other","variant_alpha","variant_gamma","variant_delta","variant_omicron"]
+    x.var_names = ["surveil", "dewpC", "doy", "dfhy"]
     ## filename that each of the above variables is read from
     ## (directory is specified in config settings)
     ## is this is None, var_fns must specify a function for generating the variable
-    x.var_files = ["tempC_7ma.csv","dewpC_7ma.csv","tsa_by_pop_daily.csv",
-                None,None,None,
-                "vacc_full_pct_to_may23.csv",None,
-                "pop_density_2020.csv","med_age_2023.csv",
-                "wastewater_daily.csv",
-                "variant_p1.csv","variant_p2.csv","variant_p3.csv",
-                "variant_other.csv","variant_alpha.csv","variant_gamma.csv","variant_delta.csv","variant_omicron.csv"]
+    x.var_files = ["surveil_weekly.csv", "dewpC_weekly.csv", None, None]
     ## function for processing each of the above files (or generating if file is None)
-    x.var_fns = [None,None,None,
-            proc_t, proc_tdecay, proc_doy,
-            proc_fwd_const, proc_tvoc,
-            proc_const, proc_const,
-            proc_wastewater, 
-            proc_repeat_across, proc_repeat_across, proc_repeat_across,
-            proc_repeat_across,proc_repeat_across,proc_repeat_across,proc_repeat_across,proc_repeat_across]
+    x.var_fns = [None, None, proc_doy, proc_days_from_Jul_1]
     ## function for normalizing each variable (or None to leave as is)
-    x.var_norm = [norm_global_Z, norm_global_Z, norm_mean_scale,
-                None, None, None,
-                norm_global_max, None,
-                norm_logZ_across, norm_Z_across,
-                None,
-                None,None,None,
-                None,None,None,None,None]
+    x.var_norm = [norm_sqrt_mean, norm_Z, None, None]
 
     return x
+
+## pretraining dataset (aggregated by hhs region)
+def domain_defaults_pretrain():
+    x = Struct()
+    
+    ##  which exogenous predictors to use by default
+    x.exog_vars = ["dfhy","dewpC","surveil"] 
+    
+    ##  information needed to generate a model ensemble, used in specify_ensemble() below
+    x.lookback_opts = [3,4,5,6]
+    x.random_reps = 5
+
+    ##
+    ## information for reading exogenous predictors, used by data_utils/forecast.py/load_exog_data()
+    ##
+    ## arbitrary names
+    x.var_names = ["surveil", "dewpC", "doy", "dfhy"]
+    ## filename that each of the above variables is read from
+    ## (directory is specified in config settings)
+    ## is this is None, var_fns must specify a function for generating the variable
+    x.var_files = ["surveil_weekly_by_hhs.csv", "dewpC_weekly_by_hhs.csv", None, None]
+    ## function for processing each of the above files (or generating if file is None)
+    x.var_fns = [None, None, proc_doy, proc_days_from_Jul_1]
+    ## function for normalizing each variable (or None to leave as is)
+    x.var_norm = [norm_sqrt_mean, norm_Z, None, None]
+
+    return x
+
 
 
 ## return a list of settings, one for each model to be ensembled
@@ -124,88 +135,275 @@ def specify_ensemble(template, specs):
 
 
 
+## state names <-> fips codes, etc.
+def code_xwalk(a,b):
+    return pd.read_csv("series_codes.csv",dtype=str).set_index(a)[b].to_dict()
+
 
 ## process data for covid-19 forecast hub
 ## expects rstate to contain quantile forecasts returned by data_utils/forecast.py/generate_quantiles()
 ## expects the forecast dict to have an entry keyed "ensemble"
-## "forecast_delay" is because the last day of available data is not the forecast start date on covid hub
-def output_csv(rstate, forecast_delay):
+## "forecast_delay" is the # of days between the last day of data and the "reference date"
+def output_df(rstate, forecast_delay_days):
+
     qtiles = rstate.qtiles
     data_index = rstate.data_index
-    data_columns = rstate.series_names
-    fc_quantiles = rstate.fc_quantiles
-    us_quantiles = rstate.sum_quantiles
+    fc_quantiles = rstate.fc_quantiles["ensemble"]
+    us_quantiles = rstate.sum_quantiles["ensemble"]
+    fc_mean = rstate.fc_mean["ensemble"]
+    us_mean = rstate.sum_mean["ensemble"]
 
-    ## forecast date: output file will contain forecast for this day forward; default = current local date
-    ##
-    ## NOTE: model generates a forecast starting with the day after the training data ends,
-    ##   which may be in the past. But only forecast_date onward is written to the output file.
+    time_freq = pd.infer_freq(data_index)
     train_end_date = pd.to_datetime(data_index[-1])
-
-    if forecast_delay is not None:
-        forecast_date = pd.to_datetime(train_end_date + pd.Timedelta(days=forecast_delay))
-    else:
-        forecast_date = pd.to_datetime(datetime.date.today()) 
+    forecast_date = pd.to_datetime(train_end_date + pd.Timedelta(days=forecast_delay_days))
 
     ## use ensembled forecasts; append US forecast derived above
-    q_ensemble = np.concatenate([fc_quantiles["ensemble"], us_quantiles["ensemble"]],axis=0)
+    q_ensemble = np.concatenate([fc_quantiles, us_quantiles],axis=0)
+    ## use mean as forecast point
+    point_ensemble = np.concatenate([fc_mean, us_mean],axis=0)
 
-    location_codes = data_columns.to_list() + ["US"] ## fips codes
+    series_names = rstate.series_names.to_list() + ["US"] 
     quantile_labels = [f'{x:.3f}' for x in qtiles]
-    date_indices = pd.date_range(train_end_date + pd.Timedelta(days=1), train_end_date + pd.Timedelta(days=q_ensemble.shape[1]))
+
+    date_indices = pd.date_range(start=train_end_date,inclusive="right",periods=1+q_ensemble.shape[1],freq=time_freq)
 
     dfs = []
     ## loop through each location in q_ensemble and make a dataframe with shape [date, value at each quantile]
     for i in range(q_ensemble.shape[0]):
-        df = pd.DataFrame(q_ensemble[i,:,:])
-        df.columns = quantile_labels
-        df.index = date_indices
-        dfs.append(df.loc[forecast_date:,:].melt(ignore_index=False,var_name="quantile").reset_index(names="target_end_date"))
+        df = pd.DataFrame(q_ensemble[i,:,:], index=date_indices, columns=quantile_labels)
+        df["mean"] = point_ensemble[i,:]
+        dfs.append(df.melt(ignore_index=False,var_name="quantile").reset_index(names="target_end_date"))
 
     ## concatenate the location dataframes and set index to location code
-    df_hub = pd.concat(dfs,keys=location_codes).droplevel(1).reset_index(names="location")
+    df_hub = pd.concat(dfs,keys=series_names).droplevel(1).reset_index(names="series_name")
 
     ## add the rest of the columns required by forecast hub
-    df_hub.loc[:,"type"] = "quantile"
-    df_hub.loc[:,"forecast_date"] = forecast_date
-    df_hub.loc[:,"target"] = df_hub.target_end_date.map(lambda d: str((d - forecast_date).days) + " day ahead inc hosp")
-    df_hub.loc[:,"value"] = df_hub.loc[:,"value"].round(2)
+    df_hub["target"] = "wk inc covid hosp"
+    df_hub["reference_date"] = forecast_date
+    df_hub["horizon"] = df_hub["target_end_date"].dt.to_period(time_freq).view(dtype="int64") - df_hub["reference_date"].dt.to_period(time_freq).view(dtype="int64")
+    df_hub["output_type"] = "quantile"
+    df_hub.loc[df_hub["quantile"]=="mean", "output_type"] = "point"
+    df_hub["output_type_id"] = df_hub["quantile"]
+    df_hub["location"] = df_hub["series_name"]
 
     ## if using error dist allows negative values, set them to 0
     df_hub.loc[df_hub["value"]<0.0,"value"] = 0.0
 
-    # write to csv
-    hub_name = "OHT_JHU-nbxd"
-    filename = os.path.join(rstate.output_dir, 
-                            forecast_date.strftime("%Y-%m-%d") + "-" + hub_name + ".csv")
-    print("writing ",filename)
-    df_hub.to_csv(filename, index=False)
-    return None
+    return df_hub, forecast_date
 
 
 
 ## turns a daily-indexed df into weekly, using reducing function fn
-## preserves the end date, not the start date
-def weekly_reduce(df, fn, s_date = "2020-07-14", e_date = None):
-    d1 = pd.to_datetime(e_date) if e_date is not None else df.index[-1]
-    d0 = d1 - pd.Timedelta(days=6)
+## each date in date_idx is the end of a week
+def weekly_reduce(df, fn, date_idx):
     data = []
-    idxs = []
-    min_date = pd.to_datetime(s_date)
-    while d0 >= min_date:
+    for d1 in date_idx:
+        d0 = d1 - pd.Timedelta(days=6)
         data.append(df.loc[d0:d1,:].apply(fn))
-        idxs.append(d1)
-        d1 = d1 - pd.Timedelta(days=7)
-        d0 = d0 - pd.Timedelta(days=7)
-    data.reverse()
-    idxs.reverse()
-    df_weekly = pd.DataFrame(data)
-    df_weekly.index = idxs
-    return df_weekly
+    return pd.DataFrame(data,index=date_idx)
+
+## replaces zeros and NaNs in input_df with noise
+## if thresh is not None, interpolates between the surrounding non-zero points
+## - inserts a value equal to noise_scale at the midpoint if the surrounding points are farther apart than thresh
+## - then adds noise on the scale of +/- noise_scale
+## otherwise, just sets values to 0.5*noise_scale to 2*noise_scale
+## rounds the final result to data_precision decimal points
+## any final values of 0 are replaced with 0.5 * noise_scale
+def zeros_to_noise(input_df, noise_scale, thresh, data_precision):
+
+    ## don't modify input df
+    df = input_df.copy(deep=True)
+
+    ## locations of zeros or nans:
+    df0 = (input_df.fillna(0) < (0.5*noise_scale))
+    ## changes zeros to nans
+    df[df0] = np.nan
+    
+    if thresh is not None:
+        zero_idxs = df0.apply(lambda s:np.nonzero(s)[0]).to_list()
+        zero_spans = [list(zip(x[(np.diff(x,prepend=-99))>1], x[(np.diff(x[::-1],prepend=99+max(x,default=0))[::-1])<-1])) for x in zero_idxs]
+        long_zero_spans = [[x for x in v if ((x[1]-x[0])>(thresh-1))] for v in zero_spans]
+        zero_midpoints = [[int(np.round(np.mean(p))) for p in v] for v in long_zero_spans]
+
+        ## before interpolation, set midpoints of long spans to a small number
+        for (col_idx,v) in enumerate(zero_midpoints):
+            for idx in v:
+                df.iloc[idx,col_idx] = noise_scale
+    
+        ## only interpolate between
+        df = df.interpolate(method="linear",limit_area="inside").ffill().bfill()
+
+    else:
+        df = df.fillna(noise_scale)
+
+    ## add noise where the data were zero or missing
+    rng = np.random.default_rng()
+    df_rand = pd.DataFrame((-1.0 * noise_scale) + (2.0 * noise_scale * rng.random(df.shape)), index=df.index, columns=df.columns)
+    df[df0] = df[df0] + df_rand[df0]
+    ## round to the precision of the original data
+    df = df.round(data_precision)
+    ## don't actually allow zero values though
+    df = df.apply(lambda s: np.maximum(s,(0.5*noise_scale)))
+    return df
+
+
+def get_hhs_regions():
+    return {
+    "Region 1": ["Connecticut", "Maine", "Massachusetts", "New Hampshire", "Rhode Island", "Vermont"],
+    "Region 2": ["New Jersey", "New York", "Puerto Rico", "Virgin Islands"],
+    "Region 3": ["Delaware", "District of Columbia", "Maryland", "Pennsylvania", "Virginia", "West Virginia"],
+    "Region 4": ["Alabama", "Florida", "Georgia", "Kentucky", "Mississippi", "North Carolina", "South Carolina", "Tennessee"],
+    "Region 5": ["Illinois", "Indiana", "Michigan", "Minnesota", "Ohio", "Wisconsin"],
+    "Region 6": ["Arkansas", "Louisiana", "New Mexico", "Oklahoma", "Texas"],
+    "Region 7": ["Iowa", "Kansas", "Missouri", "Nebraska"],
+    "Region 8": ["Colorado", "Montana", "North Dakota", "South Dakota", "Utah", "Wyoming"],
+    "Region 9": ["Arizona", "California", "Hawaii", "Nevada", "American Samoa", "Commonwealth of the Northern Mariana Islands", "Federated States of Micronesia", "Guam", "Marshall Islands", "Republic of Palau"],
+    "Region 10": ["Alaska", "Idaho", "Oregon", "Washington"]
+    }
+
+## preprocess downloaded (weekly) covid data 
+## output csv's with columns = series and rows = dates
+def read_covid_weekly():
+
+    data_dir = os.path.join("storage","download")
+    output_dir = os.path.join("storage","training_data")
+
+    hhs_regions = get_hhs_regions()
+    fips = code_xwalk("name","fips")
+    fips_abbr = code_xwalk("abbr","fips")
+
+    census = pd.read_csv(os.path.join(data_dir,"census2023.csv")).set_index("NAME")["POPESTIMATE2023"]
+    census = pd.Series({fips[k]:census[k] for k in fips}).rename("pop2023")
+    hhs_to_fips = {k:[fips[x] for x in hhs_regions[k] if x in fips] for k in hhs_regions}
+    census_by_hhs = pd.Series({k:census[hhs_to_fips[k]].sum() for k in hhs_to_fips}).rename("pop2023")
+
+    ##
+    ## weekly hospitalizations for forecast hub
+    ## from https://data.cdc.gov/Public-Health-Surveillance/Weekly-Hospital-Respiratory-Data-HRD-Metrics-by-Ju/ua7e-t2fy/about_data
+    ##
+    df = pd.read_csv(os.path.join(data_dir,"NHSN_hosp.csv"),usecols=["weekendingdate","jurisdiction","totalconfc19newadm","totalconfflunewadm","totalconfrsvnewadm"])
+    df["date"] = pd.to_datetime(df["weekendingdate"])
+    h_covid_counts = df.pivot(index="date",columns='jurisdiction',values='totalconfc19newadm')
+    ## counts for listed fips
+    h_covid_counts = h_covid_counts[[k for k in fips_abbr]].rename(columns=fips_abbr).fillna(0.0)
+    ## per capita
+    h_covid_per100k = h_covid_counts.apply(lambda s: 100000.0 * s / census[s.name])
+    ## aggregate counts by hhs region
+    covid_by_hhs = pd.DataFrame({k:h_covid_counts[hhs_to_fips[k]].sum(axis=1) for k in hhs_to_fips}, index=h_covid_counts.index)
+    ## hhs region per capita
+    covid_hhs_per100k = covid_by_hhs.apply(lambda s: 100000.0 * s / census_by_hhs[s.name])
+    ## replace zeros and missing data with noise
+    h_covid_per100k = zeros_to_noise(h_covid_per100k,0.05,None,6)
+    ## scale per-capita noise back up to counts
+    h_covid_counts = h_covid_per100k.apply(lambda s: (census[s.name]/100000.0) * s).round(1)
+
+    ##
+    ## weekly covid laboratory surveillance by hhs region, from:
+    ## https://data.cdc.gov/Laboratory-Surveillance/Percent-Positivity-of-COVID-19-Nucleic-Acid-Amplif/gvsb-yw6g/about_data
+    ##
+    df = pd.read_csv(os.path.join(data_dir,"NREVSS_covid.csv"))
+    df["date"] = pd.to_datetime(df["mmwrweek_end"])
+    df["posted"] = pd.to_datetime(df["posted"])
+    df = df[["level","percent_pos","posted","date"]].copy()
+    ## same date is posted multiple times; keep only the most recently posted
+    df = df.sort_values(["level","date","posted"],ascending=[True,True,False])
+    df = df.drop_duplicates(subset=["level","date"])
+    surveil_weekly_by_hhs = df.pivot(index="date",columns="level",values="percent_pos")[[k for k in hhs_regions]]
+
+    ## set each state's surveillance data to that of its region
+    state_to_code = {x:k for k in hhs_regions for x in hhs_regions[k]}
+    fips_to_code = {fips[k]:state_to_code[k] for k in fips}
+    surveil_weekly = pd.DataFrame({k:surveil_weekly_by_hhs[fips_to_code[k]] for k in fips_to_code},index=surveil_weekly_by_hhs.index)
+
+    ## write csv's
+    h_covid_counts.to_csv(os.path.join(output_dir,"covid_truth_weekly_counts.csv"))
+    h_covid_per100k.to_csv(os.path.join(output_dir,"covid_truth_weekly_per100k.csv"))
+    covid_by_hhs.round(1).to_csv(os.path.join(output_dir,"covid_hhs_weekly_counts.csv"))
+    covid_hhs_per100k.round(6).to_csv(os.path.join(output_dir,"covid_hhs_weekly_per100k.csv"))
+
+    census.to_csv(os.path.join(output_dir,"fips_pops.csv"))
+    census_by_hhs.to_csv(os.path.join(output_dir,"hhs_pops.csv"))
+    (census / census.sum()).rename("weight").round(8).to_csv(os.path.join(output_dir,"fips_weights.csv"))
+    (census_by_hhs / census_by_hhs.sum()).rename("weight").round(8).to_csv(os.path.join(output_dir,"hhs_weights.csv"))
+
+    surveil_weekly_by_hhs.to_csv(os.path.join(output_dir,"surveil_weekly_by_hhs.csv"))
+    surveil_weekly.to_csv(os.path.join(output_dir,"surveil_weekly.csv"))
+    
+    ## currently not using:
+    #surveil_daily = pd.DataFrame(index=pd.date_range(surveil_weekly.index[0],surveil_weekly.index[-1],freq="D")).join(surveil_weekly).interpolate(method="pchip").round(2)
+    #surveil_daily_by_hhs = pd.DataFrame(index=pd.date_range(surveil_weekly_by_hhs.index[0],surveil_weekly_by_hhs.index[-1],freq="D")).join(surveil_weekly_by_hhs).interpolate(method="pchip").round(2)
+    #surveil_daily.to_csv(os.path.join(output_dir,"surveil_daily.csv"))
+    #surveil_daily_by_hhs.to_csv(os.path.join(output_dir,"surveil_daily_by_hhs.csv"))
+
+    return (surveil_weekly.index, surveil_weekly.columns)
+
+
+
+## processes weather data from downloaded files
+## saves each variable to a file in training data folder
+def read_weather_data(weekly_idx=None):
+
+    data_dir = os.path.join("storage","download")
+    output_dir = os.path.join("storage","training_data")
+    id_column = "fips"
+
+    if weekly_idx is not None:
+        years = range(weekly_idx[0].year, 1 + weekly_idx[-1].year)
+    else:
+        current_year = (datetime.date.today() - datetime.timedelta(days=3)).year ## data is published on a delay
+        years = range(2020, 1+current_year)
+
+    weatherdata = None
+    for year in years:
+        f = os.path.join(data_dir, "weather" + str(year) + ".csv")
+        df = pd.read_csv(f,dtype={"STATION":str,"FRSHTT":str,"fips":str})
+        weatherdata = pd.concat([weatherdata,df],ignore_index=True)
+
+    ## noaa represents missing data with a bunch of 9's
+    ## fill with last reported value
+    weatherdata.loc[(weatherdata.TEMP > 200.0), "TEMP"] = np.nan
+    weatherdata.TEMP = weatherdata.TEMP.ffill()
+    weatherdata.loc[(weatherdata.DEWP > 200.0), "DEWP"] = np.nan
+    weatherdata.DEWP = weatherdata.DEWP.ffill()
+
+    weatherdata['tempC'] = (weatherdata['TEMP'].astype(float) - 32) * (5/9)
+    weatherdata['dewpC'] = (weatherdata['DEWP'].astype(float) - 32) * (5/9)
+    #following RH equation from https://bmcnoldy.rsmas.miami.edu/Humidity.html
+    weatherdata['RH'] = 100 * np.exp((17.625*weatherdata['dewpC'])/(243.04+weatherdata['dewpC']))/np.exp((17.625*weatherdata['tempC'])/(243.04+weatherdata['tempC']))
+    #following AH equation from https://carnotcycle.wordpress.com/2012/08/04/how-to-convert-relative-humidity-to-absolute-humidity/
+    weatherdata['AH'] = (6.112 * np.exp((17.67 * weatherdata['tempC'])/(weatherdata['tempC']+243.5)) * weatherdata['RH'] * 2.1674) / (273.15+weatherdata['tempC'])
+
+    for c in ["tempC","dewpC","RH","AH"]:
+        weatherdata[c] = weatherdata[c].round(2)
+
+    weatherdata.DATE = pd.to_datetime(weatherdata.DATE)
+
+    for c in ["tempC","dewpC","AH"]:
+        df_by_loc = weatherdata.pivot(columns=id_column,values=c,index="DATE")
+        if weekly_idx is not None:
+            weekly_mean = weekly_reduce(df_by_loc, np.nanmean, weekly_idx)
+            weekly_mean.interpolate(method="time",limit_direction="both").round(2).to_csv(os.path.join(output_dir, c+"_weekly.csv"))
+        df_7ma = df_by_loc.rolling(7, min_periods=1).mean()
+        df_7ma.interpolate(method="time",limit_direction="both").round(2).to_csv(os.path.join(output_dir, c+"_7ma.csv"))
+    
+    ## population-weighted average of weather data by hhs region
+    hhs_regions = get_hhs_regions()
+    fips = code_xwalk("name","fips")
+    hhs_to_fips = {k:[fips[x] for x in hhs_regions[k] if x in fips] for k in hhs_regions}
+    census = str_indexed_csv(os.path.join(output_dir,"fips_pops.csv")).iloc[:,0]
+    census_by_hhs = str_indexed_csv(os.path.join(output_dir,"hhs_pops.csv")).iloc[:,0]
+
+    f = "dewpC_weekly" ## currently only using this one
+    df = pd.read_csv(os.path.join(output_dir, f+".csv"),index_col=0)
+    df_WT = df.apply(lambda s: s * census[s.name])
+    df_by_hhs = pd.DataFrame({k:df_WT[hhs_to_fips[k]].sum(axis=1)/census_by_hhs[k] for k in hhs_to_fips}, index=df.index)
+    df_by_hhs.round(2).to_csv(os.path.join(output_dir, f+"_by_hhs.csv"))
+
+    return None
 
 
 ## saves target data to training_data folder
-def read_target_data(file_loc):
+def read_old_daily_data(file_loc):
 
     df = pd.read_csv(file_loc,dtype={"location":str})
     df = df[(df.location.str.len() == 2)]
@@ -235,51 +433,71 @@ def read_target_data(file_loc):
     df_3ma = df_by_loc.rolling(3, center=True, min_periods=1).mean()
     df_3ma.loc[data_start:,:].interpolate(method="time",limit_direction="forward").fillna(0.0).round(2).to_csv("storage/training_data/h_3ma.csv")
 
-    ## weekly mean; weeks divided so last week ends on last day of data
-    ## interpolate missing data here so we have all daily values (assume 0 before data starts)
-    df_by_loc = df_by_loc.interpolate(method="time",limit_direction="forward").fillna(0.0)
-    weekly_mean = weekly_reduce(df_by_loc, np.mean).round(2)
-    weekly_var = weekly_reduce(df_by_loc, np.var).round(2)
-    weekly_log = weekly_reduce(df_by_loc.apply(lambda s: np.log(s + 1.0)), np.mean).round(6)
-    ## to group each week's values (as a list) by that week's index:
-    #daily_by_week = weekly_reduce(df_by_loc, (lambda x: {"item":x.values.round(2)} )).map(lambda x: list(x["item"]))
-
-    weekly_mean.to_csv("storage/training_data/h_mean_weekly.csv")
-    weekly_var.to_csv("storage/training_data/h_var_weekly.csv")
-    weekly_log.to_csv("storage/training_data/h_log_weekly.csv")
-    #daily_by_week.to_csv("storage/training_data/daily_vals_weekly.csv")
-
     return (data_start, data_end)
 
 
-## reads specified year from specified weather stations, returns dataframe
-def read_noaa_dir(year,stations,fips):
-    weatherdata = None
-    for k in stations:
-        x = stations[k]
-        url = "https://www.ncei.noaa.gov/data/global-summary-of-the-day/access/" + str(year) + "/" + x + ".csv"
-        s = requests.get(url).content
-        ds = pd.read_csv(io.StringIO(s.decode('utf-8')),
-                        usecols=['STATION', 'DATE', 'LATITUDE', 'LONGITUDE', 
+
+## forecast hub targets (weekly hospitalizations)
+## from https://data.cdc.gov/Public-Health-Surveillance/Weekly-Hospital-Respiratory-Data-HRD-Metrics-by-Ju/ua7e-t2fy/about_data
+def download_forecast_hub(dest):
+
+    u = "https://data.cdc.gov/resource/ua7e-t2fy.csv?$limit=500000"
+    response = requests.get(u)
+
+    with open(os.path.join(dest,"NHSN_hosp.csv"), "wb") as file:
+        file.write(response.content)
+
+
+## weekly covid lab surveil by hhs
+## https://data.cdc.gov/Laboratory-Surveillance/Percent-Positivity-of-COVID-19-Nucleic-Acid-Amplif/gvsb-yw6g/about_data
+def download_covid_surveil(dest):
+    u = "https://data.cdc.gov/resource/gvsb-yw6g.csv?$limit=5000000"
+    response = requests.get(u)
+
+    with open(os.path.join(dest,"NREVSS_covid.csv"), "wb") as file:
+        file.write(response.content)
+
+
+## tar file from noaa
+def read_weather_local(year,station):
+    with tarfile.open('storage/weather/'+str(year)+'.tar.gz','r') as t:
+        with t.extractfile(station+'.csv') as f:
+            ds = pd.read_csv(f,usecols=['STATION', 'DATE', 'LATITUDE', 'LONGITUDE', 
                                 'ELEVATION', 'NAME', 'TEMP', 'DEWP', 'SLP',
                                 'STP', 'VISIB','WDSP', 'MXSPD', 'GUST',
                                 'MAX', 'MIN', 'PRCP', 'SNDP', 'FRSHTT'],
-                        dtype={"STATION":str,"FRSHTT":str})
+                                dtype={"STATION":str,"FRSHTT":str})
+    return ds
+
+## reads specified year from specified weather stations, returns dataframe
+## stations keyed by state abbrev.
+def read_noaa_dir(year,stations,fips,abbr_to_name,local_archive=False):
+
+    usecols=['STATION', 'DATE', 'LATITUDE', 'LONGITUDE', 
+            'ELEVATION', 'NAME', 'TEMP', 'DEWP', 'SLP',
+            'STP', 'VISIB','WDSP', 'MXSPD', 'GUST',
+            'MAX', 'MIN', 'PRCP', 'SNDP', 'FRSHTT']
+    dtype={"STATION":str,"FRSHTT":str}
+
+    weatherdata = None
+    for k in stations:
+        x = stations[k]
+
+        if local_archive:
+             ds = read_weather_local(year,x)
+        else:
+            url = "https://www.ncei.noaa.gov/data/global-summary-of-the-day/access/" + str(year) + "/" + x + ".csv"
+            s = requests.get(url).content
+            ds = pd.read_csv(io.StringIO(s.decode('utf-8')),usecols=usecols,dtype=dtype)
+
         ds["state"] = k
         ds["fips"] = fips[k]
+        ds["series_name"] = abbr_to_name[k]
         weatherdata = pd.concat([weatherdata,ds],ignore_index=True)
     return weatherdata
 
 
-## reads and processes weather data into local files
-## uses saved local files for previous years, but always re-reads current year
-## saves each variable to a file in training data folder
-def read_weather_data(targ_data_start, targ_data_end):
-
-    current_year = (datetime.date.today() - datetime.timedelta(days=3)).year ## data is published on a delay
-    previous_years = range(2020,current_year)
-
-    os.makedirs("storage/weather",exist_ok=True)
+def download_weather(year, dest, local_archive=False):
 
     stations = {"AL": "72228013876",
                 "AK": "70273026451",
@@ -335,70 +553,25 @@ def read_weather_data(targ_data_start, targ_data_end):
                 "PR": "78526011641"
                 }
 
-    fips = {'AL':'01', 'AK':'02', 'AZ':'04', 'AR':'05', 'CA':'06', 'CO':'08', 'CT':'09', 'DE':'10', 'DC':'11', 
-            'FL':'12', 'GA':'13', 'HI':'15', 'ID':'16', 'IL':'17', 'IN':'18', 'IA':'19', 'KS':'20', 'KY':'21', 
-            'LA':'22', 'ME':'23', 'MD':'24', 'MA':'25', 'MI':'26', 'MN':'27', 'MS':'28', 'MO':'29', 'MT':'30', 
-            'NE':'31', 'NV':'32', 'NH':'33', 'NJ':'34', 'NM':'35', 'NY':'36', 'NC':'37', 'ND':'38', 'OH':'39', 
-            'OK':'40', 'OR':'41', 'PA':'42', 'RI':'44', 'SC':'45', 'SD':'46', 'TN':'47', 'TX':'48', 'UT':'49', 
-            'VT':'50', 'VA':'51', 'WA':'53', 'WV':'54', 'WI':'55', 'WY':'56', 'PR':'72'}
+    df = read_noaa_dir(year, stations, code_xwalk("abbr","fips"), code_xwalk("abbr","name"), local_archive)
+    df.to_csv(os.path.join(dest,"weather"+str(year)+".csv"),index=False)
 
-    weatherdata = None
-    for year in previous_years:
-        f = "storage/weather/weather" + str(year) + ".csv"
-        if os.path.isfile(f):
-            df = pd.read_csv(f,dtype={"STATION":str,"FRSHTT":str,"fips":str})
-        else:
-            print("downloading weather ",year)
-            df = read_noaa_dir(year,stations,fips)
-            df.to_csv(f,index=False)
-        weatherdata = pd.concat([weatherdata,df],ignore_index=True)
 
-    ## re-read current year weather every time
-    print("downloading weather ",current_year)
-    df = read_noaa_dir(current_year,stations,fips)
-    weatherdata = pd.concat([weatherdata,df],ignore_index=True)
 
-    ## noaa represents missing data with a bunch of 9's
-    ## fill with last reported value
-    weatherdata.loc[(weatherdata.TEMP > 200.0), "TEMP"] = np.nan
-    weatherdata.TEMP = weatherdata.TEMP.ffill()
-    weatherdata.loc[(weatherdata.DEWP > 200.0), "DEWP"] = np.nan
-    weatherdata.DEWP = weatherdata.DEWP.ffill()
 
-    weatherdata['tempC'] = (weatherdata['TEMP'].astype(float) - 32) * (5/9)
-    weatherdata['dewpC'] = (weatherdata['DEWP'].astype(float) - 32) * (5/9)
-    #following RH equation from https://bmcnoldy.rsmas.miami.edu/Humidity.html
-    weatherdata['RH'] = 100 * np.exp((17.625*weatherdata['dewpC'])/(243.04+weatherdata['dewpC']))/np.exp((17.625*weatherdata['tempC'])/(243.04+weatherdata['tempC']))
-    #following AH equation from https://carnotcycle.wordpress.com/2012/08/04/how-to-convert-relative-humidity-to-absolute-humidity/
-    weatherdata['AH'] = (6.112 * np.exp((17.67 * weatherdata['tempC'])/(weatherdata['tempC']+243.5)) * weatherdata['RH'] * 2.1674) / (273.15+weatherdata['tempC'])
 
-    for c in ["tempC","dewpC","RH","AH"]:
-        weatherdata[c] = weatherdata[c].round(2)
 
-    ## save a local snapshot
-    weatherdata.to_csv('storage/weather/weatherdata.csv',index=False)
 
-    weatherdata.DATE = pd.to_datetime(weatherdata.DATE)
-
-    for c in ["tempC","dewpC","AH"]:
-        df_by_loc = weatherdata.pivot(columns="fips",values=c,index="DATE")
-        weekly_mean = weekly_reduce(df_by_loc, np.nanmean, targ_data_start, targ_data_end)
-        weekly_mean.interpolate(method="time",limit_direction="both").round(2).to_csv("storage/training_data/"+c+"_weekly.csv")
-        df_7ma = df_by_loc.rolling(7, min_periods=1).mean().loc[targ_data_start:targ_data_end,:]
-        df_7ma.interpolate(method="time",limit_direction="both").round(2).to_csv("storage/training_data/"+c+"_7ma.csv")
+def download_training_data_old():
+    f = "https://media.githubusercontent.com/media/reichlab/covid19-forecast-hub/master/data-truth/truth-Incident%20Hospitalizations.csv"
+    (h_data_start, h_data_end) = read_old_daily_data(f)
+    read_weather_data()
+    #read_travel_data()
     return None
 
 
 def fips_names():
-    return {'Alabama':'01', 'Alaska':'02', 'Arizona':'04', 'Arkansas':'05', 'California':'06', 'Colorado':'08', 
-            'Connecticut':'09', 'Delaware':'10', 'District of Columbia':'11', 'Florida':'12', 'Georgia':'13', 
-            'Hawaii':'15', 'Idaho':'16', 'Illinois':'17', 'Indiana':'18', 'Iowa':'19', 'Kansas':'20', 'Kentucky':'21', 
-            'Louisiana':'22', 'Maine':'23', 'Maryland':'24', 'Massachusetts':'25', 'Michigan':'26', 'Minnesota':'27', 
-            'Mississippi':'28', 'Missouri':'29', 'Montana':'30', 'Nebraska':'31', 'Nevada':'32', 'New Hampshire':'33', 
-            'New Jersey':'34', 'New Mexico':'35', 'New York':'36', 'North Carolina':'37', 'North Dakota':'38', 
-            'Ohio':'39', 'Oklahoma':'40', 'Oregon':'41', 'Pennsylvania':'42', 'Rhode Island':'44', 'South Carolina':'45', 
-            'South Dakota':'46', 'Tennessee':'47', 'Texas':'48', 'Utah':'49', 'Vermont':'50', 'Virginia':'51', 
-            'Washington':'53', 'West Virginia':'54', 'Wisconsin':'55', 'Wyoming':'56', 'Puerto Rico':'72'}
+    return code_xwalk("name","fips")
 
 def read_travel_data():
 
@@ -426,15 +599,9 @@ def read_travel_data():
     ## use raw daily instead of moving average; hopefully the model can detect spikes
     tsa_by_pop.round(2).to_csv("storage/training_data/tsa_by_pop_daily.csv")
     ## for weekly, use each week's max
-    weekly_reduce(tsa_by_pop, np.nanmax).round(2).to_csv("storage/training_data/tsa_by_pop_weekly.csv")
+    #weekly_reduce(tsa_by_pop, np.nanmax).round(2).to_csv("storage/training_data/tsa_by_pop_weekly.csv")
 
 
-def download_training_data():
-    f = "https://media.githubusercontent.com/media/reichlab/covid19-forecast-hub/master/data-truth/truth-Incident%20Hospitalizations.csv"
-    (h_data_start, h_data_end) = read_target_data(f)
-    read_weather_data(h_data_start,h_data_end)
-    #read_travel_data()
-    return None
 
 
 def read_pop_density():

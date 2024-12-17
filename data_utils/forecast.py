@@ -51,6 +51,11 @@ def tryJSON(filename):
         d = {}
     return d
 
+## because pandas won't do this correctly
+def str_indexed_csv(f):
+    df = pd.read_csv(f,dtype={0:str})
+    return df.set_index(df.columns[0])
+
 
 ## default model settings; entries in settings.json take precedence
 ## this data structure is meant to hold settings that can change between models within an ensemble
@@ -71,7 +76,7 @@ def default_settings(filename="settings.json"):
 
     settings.lookback = d.get("lookback",4)  ## backward window size, in horizons
     ## forecast horizon (in time units)
-    settings.horizon = d.get("horizon",40) #6
+    settings.horizon = d.get("horizon",6) #40
 
     ## loss function (defined in experiments/trainer.py)
     settings.lfn_name = d.get("lfn_name","t_nll")  ## t_nll / norm_nll / t_pen
@@ -222,8 +227,8 @@ def init_target_data(rstate, settings):
     ## if target series are per-capita, need weights for forecasting the sum
     ## (if they are counts, can just sum them; leave series_weights as None)
     if (rstate.weight_file is not None) and (rstate.weight_file != ""):
-        df = pd.read_csv(os.path.join(rstate.data_dir,rstate.weight_file),index_col=0)
-        series_weights = np.array([df.loc[s,"weight"] for s in series_names])[:,None] ## dims [series, 1]
+        df = str_indexed_csv(os.path.join(rstate.data_dir,rstate.weight_file)).iloc[:,0]
+        series_weights = np.array([df[s] for s in series_names])[:,None] ## dims [series, 1]
     else:
         series_weights = None
 
@@ -382,6 +387,13 @@ def make_training_fn(rstate):
         snapshot_manager = SnapshotManager(snapshot_dir=os.path.join(rstate.snapshot_dir, model_name),
                                             total_iterations=settings.iterations)
 
+        ## if cut didn't leave enough validation data, pad it so validation fn doesn't crash
+        validation_data = None
+        if rstate.test_targets is not None:
+            validation_data = rstate.test_targets[:,0:settings.horizon]
+            if validation_data.shape[1] < settings.horizon:
+                validation_data = np.pad(validation_data, ((0,0), (0, (settings.horizon - validation_data.shape[1]))), mode="edge")
+
         ## train the model using selected fn
         model = train_fn(snapshot_manager=snapshot_manager,
                         model=model,
@@ -391,7 +403,7 @@ def make_training_fn(rstate):
                         learning_rate=settings.init_LR,
                         pretrained_model_file=pretrained_model_file,
                         validation_input = train_ds.last_insample_window() if rstate.test_targets is not None else None,
-                        validation_data = rstate.test_targets[:,0:settings.horizon] if rstate.test_targets is not None else None)
+                        validation_data = validation_data)
         
         # training done; generate forecasts
         f_mu, f_var = generate_forecast(model, train_ds)
